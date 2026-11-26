@@ -1,0 +1,326 @@
+import { __esmMin } from "./rolldown-runtime-DXoylpqc.js";
+import { LC, init_machoContainer, init_machoLoadCommandCodes, init_machoLoadCommands, machoWordReader, validateFatSliceIdentity } from "./machoLoadCommands-DCQgk7s-.js";
+import { init_machoSectionHeader, init_machoSegmentHeader, isMachoZeroFillSection, machoSectionHeaderSize, machoSegmentHeaderSize, machoSegmentSectionTableFits, readMachoSectionHeader, readMachoSegmentHeader } from "./machoSegmentHeader-Bvz3C4rO.js";
+import { frameLoadCommands, init_machoLoadCommandReader, readMachoContainer, readSliceCommandTable } from "./machoLoadCommandReader-BBTljx6_.js";
+
+//#region dist/domain/apple/machoEncryptionReader.js
+var ENCRYPTION_COMMAND_SIZE, RETAINED_ENCRYPTION_COMMANDS, readMachoEncryption, unread, readSlice, isEncryptionCommand, decodeEncryptionCommand, classifyCommand, encryptedRange, mapRange, unmapped, mappingRecords, decodeSegment, fixedName, hex;
+function init_machoEncryptionReader() {
+	return (init_machoEncryptionReader = __esmMin((() => {
+		init_machoLoadCommandCodes();
+		init_machoLoadCommands();
+		init_machoContainer();
+		init_machoSectionHeader();
+		init_machoSegmentHeader();
+		init_machoLoadCommandReader();
+		ENCRYPTION_COMMAND_SIZE = {
+			32: 20,
+			64: 24
+		};
+		RETAINED_ENCRYPTION_COMMANDS = 2;
+		readMachoEncryption = async (readAt, size, maximumMappingRecords) => {
+			const budget = {
+				maximum: maximumMappingRecords,
+				remaining: maximumMappingRecords
+			};
+			const container = await readMachoContainer(readAt, size);
+			if (container.kind === "not-mach-o") return { status: "not-mach-o" };
+			if (container.kind === "issue") return {
+				status: container.status,
+				reason: container.reason
+			};
+			if (container.kind === "thin") return {
+				status: "parsed",
+				slices: [await readSlice(readAt, {
+					offset: 0,
+					size,
+					fat: null
+				}, budget)]
+			};
+			const { hidden } = container;
+			if (hidden !== null && hidden.status !== "declared") return {
+				status: hidden.status,
+				reason: hidden.reason
+			};
+			const slices = [];
+			for (const [index, declaration] of container.header.slices.entries()) {
+				const rangeIssue = container.header.rangeIssues[index] ?? null;
+				slices.push(rangeIssue === null ? await readSlice(readAt, {
+					offset: declaration.offset,
+					size: declaration.size,
+					fat: declaration
+				}, budget) : unread(declaration, rangeIssue.category === "unsupported" ? "unknown" : "malformed", rangeIssue.reason));
+			}
+			if (hidden !== null) slices.push(hidden.rangeIssue === null ? await readSlice(readAt, {
+				offset: hidden.declaration.offset,
+				size: hidden.declaration.size,
+				fat: hidden.declaration
+			}, budget) : unread(hidden.declaration, "malformed", hidden.rangeIssue));
+			return {
+				status: "parsed",
+				slices
+			};
+		};
+		unread = (declaration, status, reason) => ({
+			architecture: null,
+			cpu_type: declaration.cpuType,
+			cpu_subtype: declaration.cpuSubtype,
+			container_file_offset: declaration.offset,
+			size: declaration.size,
+			status,
+			malformed_kind: status === "malformed" ? "structure" : null,
+			reason,
+			commands: [],
+			range: null
+		});
+		readSlice = async (readAt, slice, budget) => {
+			const table = await readSliceCommandTable(readAt, slice.offset, slice.size);
+			const base = {
+				architecture: null,
+				cpu_type: table.header?.cpuType ?? slice.fat?.cpuType ?? null,
+				cpu_subtype: table.header?.cpuSubtype ?? slice.fat?.cpuSubtype ?? null,
+				container_file_offset: slice.offset,
+				size: slice.size
+			};
+			const commands = [];
+			let encryptionCommands = 0;
+			const encryption = {
+				first: null,
+				failure: null
+			};
+			let segments = [];
+			let segmentRecords = 0;
+			const incomplete = ({ status, reason }) => ({
+				...base,
+				status: status === "unsupported" ? "unknown" : "malformed",
+				malformed_kind: status === "unsupported" ? null : "structure",
+				reason,
+				commands,
+				range: null
+			});
+			if (table.status !== "read") return incomplete(table);
+			const { header } = table;
+			const framed = frameLoadCommands(table, (command) => {
+				if (isEncryptionCommand(command.command)) {
+					encryptionCommands += 1;
+					const decoded = decodeEncryptionCommand(command);
+					if (commands.length < RETAINED_ENCRYPTION_COMMANDS) commands.push(decoded);
+					const checked = classifyCommand(decoded, header, slice.size);
+					if (checked.status === "malformed") encryption.failure ??= checked.reason;
+					else encryption.first ??= checked.command;
+				} else if (segments !== null && (command.command === LC.SEGMENT || command.command === LC.SEGMENT_64)) {
+					segmentRecords += mappingRecords(command);
+					if (segmentRecords > budget.remaining) segments = null;
+					else segments.push(command);
+				}
+			});
+			if (framed.status !== "framed") return incomplete(framed);
+			const identityIssue = slice.fat === null ? null : validateFatSliceIdentity(slice.fat, {
+				cpuType: header.cpuType,
+				cpuSubtype: header.cpuSubtype
+			});
+			if (identityIssue !== null) return {
+				...base,
+				status: "malformed",
+				malformed_kind: "structure",
+				reason: identityIssue,
+				commands,
+				range: null
+			};
+			if (encryption.failure !== null) return {
+				...base,
+				status: "malformed",
+				malformed_kind: "structure",
+				reason: encryptionCommands > 1 ? `slice has ${encryptionCommands} encryption load commands; ${encryption.failure}` : encryption.failure,
+				commands,
+				range: null
+			};
+			if (encryptionCommands > 1) return {
+				...base,
+				status: "malformed",
+				malformed_kind: "duplicate-commands",
+				reason: `slice has ${encryptionCommands} encryption load commands`,
+				commands,
+				range: null
+			};
+			const command = encryption.first;
+			if (command === null) return {
+				...base,
+				status: "absent",
+				malformed_kind: null,
+				reason: null,
+				commands,
+				range: null
+			};
+			const range = encryptedRange(command, header, segments, slice.offset, budget.maximum);
+			if (range.mapping.status === "mapped") budget.remaining -= segmentRecords;
+			return {
+				...base,
+				status: command.cryptid === 0 ? "not-encrypted" : "encrypted",
+				malformed_kind: null,
+				reason: null,
+				commands,
+				range
+			};
+		};
+		isEncryptionCommand = (command) => command === LC.ENCRYPTION_INFO || command === LC.ENCRYPTION_INFO_64;
+		decodeEncryptionCommand = ({ command, body, index }) => {
+			const reader = machoWordReader(body, true);
+			const word = (at) => body.byteLength >= at + 4 ? reader.u32(at) : null;
+			const wide = command === LC.ENCRYPTION_INFO_64;
+			return {
+				kind: wide ? "LC_ENCRYPTION_INFO_64" : "LC_ENCRYPTION_INFO",
+				index,
+				cmdsize: body.byteLength,
+				cryptoff: word(8),
+				cryptsize: word(12),
+				cryptid: word(16),
+				pad: wide ? word(20) : null
+			};
+		};
+		classifyCommand = (command, header, sliceSize) => {
+			const width = header.wide ? 64 : 32;
+			const expectedKind = header.wide ? "LC_ENCRYPTION_INFO_64" : "LC_ENCRYPTION_INFO";
+			if (command.kind !== expectedKind) return {
+				status: "malformed",
+				reason: `load command ${command.index} ${command.kind} appears in a ${width}-bit image`
+			};
+			const expectedSize = ENCRYPTION_COMMAND_SIZE[width];
+			const { cryptoff, cryptsize, cryptid } = command;
+			if (command.cmdsize !== expectedSize || cryptoff === null || cryptsize === null || cryptid === null) return {
+				status: "malformed",
+				reason: `load command ${command.index} ${command.kind} has cmdsize ${command.cmdsize}, expected ${expectedSize}`
+			};
+			if (cryptoff + cryptsize > sliceSize) return {
+				status: "malformed",
+				reason: `load command ${command.index} encrypted range ends at ${cryptoff + cryptsize}, beyond the ${sliceSize}-byte slice`
+			};
+			return {
+				status: "valid",
+				command: {
+					...command,
+					cryptoff,
+					cryptsize,
+					cryptid
+				}
+			};
+		};
+		encryptedRange = (command, header, segmentCommands, containerOffset, maximumMappingRecords) => {
+			const start = command.cryptoff;
+			const end = command.cryptoff + command.cryptsize;
+			return {
+				content: command.cryptid === 0 ? "plaintext" : "ciphertext",
+				slice_start: start,
+				slice_end: end,
+				container_start: containerOffset + start,
+				container_end: containerOffset + end,
+				mapping: segmentCommands === null ? {
+					status: "unknown",
+					reason: `mapping needs more than the ${maximumMappingRecords} segment and section records shared by all slices`
+				} : mapRange(start, end, header, segmentCommands)
+			};
+		};
+		mapRange = (start, end, header, segmentCommands) => {
+			const segments = [];
+			for (const command of segmentCommands) {
+				if (command.command === LC.SEGMENT_64 !== header.wide) return {
+					status: "unknown",
+					reason: `load command ${command.index} ${command.command === LC.SEGMENT_64 ? "LC_SEGMENT_64" : "LC_SEGMENT"} appears in a ${header.wide ? 64 : 32}-bit image`
+				};
+				const segment = decodeSegment(command);
+				if (typeof segment === "string") return {
+					status: "unknown",
+					reason: segment
+				};
+				if (segment.vmSize > 0n && BigInt(segment.fileSize) > segment.vmSize) return {
+					status: "unknown",
+					reason: `load command ${segment.index} segment ${segment.name} file size ${segment.fileSize} exceeds its VM size ${segment.vmSize}`
+				};
+				if (segment.vmAddress + segment.vmSize > (header.wide ? 2n ** 64n : 2n ** 32n)) return {
+					status: "unknown",
+					reason: `load command ${segment.index} segment ${segment.name} VM range exceeds the ${header.wide ? 64 : 32}-bit address space`
+				};
+				segments.push(segment);
+			}
+			const fileBacked = segments.filter(({ fileSize }) => fileSize > 0).sort((left, right) => left.fileOffset - right.fileOffset);
+			const fragments = [];
+			let cursor = start;
+			for (const segment of fileBacked) {
+				const from = Math.max(cursor, segment.fileOffset);
+				const to = Math.min(end, segment.fileOffset + segment.fileSize);
+				if (from >= to) continue;
+				if (from > cursor) fragments.push(unmapped(cursor, from));
+				const mapped = segment.vmSize > 0n;
+				fragments.push({
+					slice_start: from,
+					slice_end: to,
+					segment: segment.name,
+					vm_start: mapped ? hex(segment.vmAddress + BigInt(from - segment.fileOffset)) : null,
+					vm_end: mapped ? hex(segment.vmAddress + BigInt(to - segment.fileOffset)) : null
+				});
+				cursor = Math.max(cursor, to);
+			}
+			if (cursor < end) fragments.push(unmapped(cursor, end));
+			const sections = fileBacked.flatMap((segment) => segment.sections.filter(({ zerofill, size, offset }) => !zerofill && Math.max(start, offset, segment.fileOffset) < Math.min(end, offset + size, segment.fileOffset + segment.fileSize)).map(({ name }) => ({
+				segment: segment.name,
+				section: name
+			})));
+			return {
+				status: "mapped",
+				fragments,
+				sections
+			};
+		};
+		unmapped = (from, to) => ({
+			slice_start: from,
+			slice_end: to,
+			segment: null,
+			vm_start: null,
+			vm_end: null
+		});
+		mappingRecords = ({ command, body }) => {
+			const wide = command === LC.SEGMENT_64;
+			return 2 + Math.max(0, Math.floor((body.byteLength - machoSegmentHeaderSize(wide)) / machoSectionHeaderSize(wide)));
+		};
+		decodeSegment = ({ command, body, index }) => {
+			const wide = command === LC.SEGMENT_64;
+			const parsed = readMachoSegmentHeader(body, wide, true);
+			if (!parsed.ok) return `load command ${index} is too short for a segment command`;
+			const segment = parsed.value;
+			const fileOffset = Number(segment.fileOffset);
+			const fileSize = Number(segment.fileSize);
+			if (!Number.isSafeInteger(fileOffset + fileSize)) return `load command ${index} segment file range exceeds the safe range`;
+			const sectionSize = machoSectionHeaderSize(wide);
+			if (!machoSegmentSectionTableFits(segment, body.byteLength, wide)) return `load command ${index} section records exceed cmdsize`;
+			const sections = [];
+			for (let section = 0; section < segment.sectionCount; section += 1) {
+				const at = segment.headerSize + section * sectionSize;
+				const header = readMachoSectionHeader(body.subarray(at, at + sectionSize), wide, true);
+				if (!header.ok) return `load command ${index} section records exceed cmdsize`;
+				sections.push({
+					name: fixedName(header.value.nameBytes),
+					offset: header.value.offset,
+					size: Number(header.value.size),
+					zerofill: isMachoZeroFillSection(header.value.flags)
+				});
+			}
+			return {
+				index,
+				name: fixedName(segment.nameBytes),
+				vmAddress: segment.address,
+				vmSize: segment.memorySize,
+				fileOffset,
+				fileSize,
+				sections
+			};
+		};
+		fixedName = (bytes) => {
+			const end = bytes.indexOf(0);
+			return Buffer.from(end < 0 ? bytes : bytes.subarray(0, end)).toString("latin1");
+		};
+		hex = (value) => `0x${value.toString(16)}`;
+	})))();
+}
+
+//#endregion
+export { init_machoEncryptionReader, readMachoEncryption };

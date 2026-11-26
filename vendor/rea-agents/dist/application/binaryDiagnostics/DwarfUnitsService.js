@@ -1,0 +1,84 @@
+import { machoSliceFamily } from "../../domain/apple/machoTargetSelection.js";
+import { AnalysisOutputError } from "../../domain/analysisErrorCore.js";
+import { metadataReportSubjectFormat } from "../../domain/apple/machoTargetSelection.js";
+import { binaryMetadataArchitecture } from "../../domain/binaryMetadataArchitecture.js";
+import { createEvidence } from "../../domain/evidence.js";
+import { dwarfUnitsSchema, inspectDwarfUnitsInputSchema, } from "../../domain/native/dwarfUnits.js";
+import { err } from "../../domain/result.js";
+import { completeProviderEvidence } from "../ProviderOperationExecution.js";
+import { callerAnalysisParameters, parseAnalysisInput, } from "../AnalysisInput.js";
+const OPERATION = "inspect_dwarf_units";
+/** Shared caller validation, output parsing and Evidence provenance for CLI/MCP. */
+export class DwarfUnitsService {
+    provider;
+    constructor(provider) {
+        this.provider = provider;
+    }
+    close() {
+        return this.provider.close?.() ?? Promise.resolve();
+    }
+    async inspect(rawInput, options) {
+        const input = parseAnalysisInput(OPERATION, rawInput, inspectDwarfUnitsInputSchema, options?.signal);
+        if (!input.ok)
+            return input;
+        const result = await this.provider.inspect(input.value, options);
+        if (!result.ok)
+            return result;
+        const report = dwarfUnitsSchema.safeParse(result.value);
+        if (!report.success ||
+            report.data.artifact.path !== input.value.path ||
+            !validReport(report.data, input.value))
+            return err(new AnalysisOutputError(OPERATION, "DWARF compile-unit provider returned malformed output or changed artifact identity."));
+        const value = report.data;
+        const architecture = value.architecture === null
+            ? undefined
+            : binaryMetadataArchitecture(value.architecture);
+        const locations = [
+            { kind: "artifact-path", path: value.artifact.path },
+            ...value.sections.flatMap((section) => section.size === 0
+                ? []
+                : [
+                    {
+                        kind: "file-offset-range",
+                        start: section.offset,
+                        end: section.offset + section.size,
+                    },
+                ]),
+            ...value.units.flatMap((unit) => unit.file_offset === null
+                ? []
+                : [
+                    {
+                        kind: "file-offset-range",
+                        start: unit.file_offset,
+                        end: unit.file_offset + unit.length,
+                    },
+                ]),
+        ];
+        return completeProviderEvidence(createEvidence({
+            path: value.artifact.path,
+            format: metadataReportSubjectFormat(value),
+            sha256: value.artifact.sha256,
+            ...(architecture === undefined ? {} : { architecture }),
+        }, this.provider.identity, {
+            operation: OPERATION,
+            parameters: callerAnalysisParameters(rawInput)(input.value),
+            result: value,
+            confidence: "observed",
+            limitations: value.limitations,
+            locations,
+        }), options?.signal);
+    }
+}
+const validReport = (report, input) => {
+    if (report.artifact.bytes > input.max_file_bytes)
+        return false;
+    if (report.page.offset !== input.offset || report.page.limit !== input.limit)
+        return false;
+    const requested = input.architecture;
+    const slice = report.selected_slice;
+    if ((requested === undefined) !== (slice === undefined))
+        return false;
+    // Reports name the CPU family; arm64e selects an arm64 slice.
+    return (requested === undefined ||
+        report.architecture === machoSliceFamily(requested));
+};

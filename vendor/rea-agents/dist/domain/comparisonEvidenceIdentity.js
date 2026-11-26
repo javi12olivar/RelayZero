@@ -1,0 +1,59 @@
+import { unknownTarget, sameTargetIdentity } from "./targetIdentity.js";
+import { createAnalysisProfile } from "./analysisProfile.js";
+import { PROCESS_PROVIDER, isProcessEvidenceProvider, } from "./process/processEvidenceProvider.js";
+/** Canonical provider identity for deterministic artifact comparisons. */
+export const ARTIFACT_COMPARISON_PROVIDER = {
+    id: "rea-artifact-comparison",
+    name: "REA artifact comparison",
+    version: "1",
+};
+/** Canonical provider identity for deterministic function comparisons. */
+export const FUNCTION_COMPARISON_PROVIDER = {
+    id: "rea-function-comparison",
+    name: "REA function comparison",
+    version: "1",
+};
+export const FUNCTION_COMPARISON_PROFILE = createAnalysisProfile(FUNCTION_COMPARISON_PROVIDER, { workflow_revision: 2 });
+const COMPARISON_EVIDENCE_IDENTITIES = {
+    compare_artifacts: {
+        predicate: "rea.artifact-comparison",
+        provider: ARTIFACT_COMPARISON_PROVIDER,
+    },
+    compare_functions: {
+        predicate: "rea.function-comparison",
+        provider: FUNCTION_COMPARISON_PROVIDER,
+    },
+    compare_process_captures: {
+        predicate: "rea.process-comparison",
+        provider: PROCESS_PROVIDER,
+    },
+    compare_web_screenshots: {
+        predicate: "rea.web-screenshot-diff",
+        provider: {
+            id: "rea-cdp-browser",
+            name: "REA Chrome DevTools Protocol observation provider",
+            version: "2",
+        },
+    },
+};
+/** Whether an operation is one of the comparison workflows this domain owns. */
+export const isComparisonEvidenceOperation = (operation) => Object.hasOwn(COMPARISON_EVIDENCE_IDENTITIES, operation);
+/** Check shared Evidence identity without imposing a consumer's link policy. */
+export const hasComparisonEvidenceIdentity = (evidence) => {
+    if (!isComparisonEvidenceOperation(evidence.operation))
+        return false;
+    const expected = COMPARISON_EVIDENCE_IDENTITIES[evidence.operation];
+    const providerMatches = evidence.operation === "compare_process_captures"
+        ? isProcessEvidenceProvider(evidence.provider)
+        : evidence.provider.id === expected.provider.id &&
+            evidence.provider.name === expected.provider.name &&
+            evidence.provider.version === expected.provider.version;
+    const subjectMatches = evidence.operation === "compare_web_screenshots"
+        ? sameTargetIdentity(evidence.subject.identity, unknownTarget("not-observed"))
+        : sameTargetIdentity(evidence.subject.identity, unknownTarget("derived-from-linked-evidence"));
+    return (evidence.predicate_type === expected.predicate &&
+        providerMatches &&
+        evidence.confidence === "derived" &&
+        evidence.authority === "analyst-inference" &&
+        subjectMatches);
+};

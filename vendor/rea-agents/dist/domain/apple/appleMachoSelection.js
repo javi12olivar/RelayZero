@@ -1,0 +1,217 @@
+import { malformedInput, truncatedInput, unsupportedInput, } from "../parseFailure.js";
+import { LC } from "./machoLoadCommandCodes.js";
+import { machoDependencyCommand, readMachoDylibCommandFacts, } from "./machoDylibCommand.js";
+import { machoSectionHeaderSize, readMachoSectionHeader, } from "./machoSectionHeader.js";
+import { admitMachoSegmentMapping, machoSegmentSectionTableFits, readMachoSegmentHeader, } from "./machoSegmentHeader.js";
+import { MachoLoadCommandCursor, readMachoDyldInfoCommand, readMachoLinkeditDataCommand, machoCommandTableIssue, readMachoLoadCommandDeclarations, } from "./machoLoadCommands.js";
+import { BinaryFormatFailure, createFileMappingIndex, } from "../binaryContainer.js";
+import { decodeMachoFixedName, decodeMachoName } from "./appleMachoNames.js";
+const hex = (value) => `0x${value.toString(16)}`;
+/**
+ * Parse segments/sections of the little-endian 64-bit image `selectMachoSlice`
+ * selected from `bytes`; the selection owns slice choice and CPU admission.
+ */
+export const parseMachoLayout = (bytes, selected) => {
+    if (bytes.length < 4)
+        throw truncatedInput("macho", "Truncated Mach-O header");
+    const slice = selected.fileOffset;
+    const sliceEnd = slice + selected.bytes.length;
+    if (slice + 4 > sliceEnd)
+        throw truncatedInput("macho", "Truncated Mach-O header");
+    const selectedBytes = bytes.subarray(slice, sliceEnd);
+    const declarations = readMachoLoadCommandDeclarations(selectedBytes, selectedBytes.length);
+    if (!declarations.ok)
+        throw truncatedInput("macho", "Truncated Mach-O header");
+    if (declarations.value === null) {
+        if (selectedBytes.length < 32)
+            throw truncatedInput("macho", "Truncated Mach-O header");
+        // No Mach-O magic this reader knows: an unsupported header, and not a
+        // recognized class with a metadata capability limit.
+        throw unsupportedInput("macho", "Only little-endian 64-bit Mach-O metadata is supported");
+    }
+    const table = declarations.value;
+    const { cpuType, cpuSubtype } = table.identity;
+    const fat = selected.selection;
+    if (table.wide && !table.littleEndian) {
+        if (cpuType !== 0x01000012)
+            throw new BinaryFormatFailure("unsupported", "Unsupported big-endian Mach-O CPU type");
+        throw new BinaryFormatFailure("unsupported", "Unsupported big-endian 64-bit PowerPC Mach-O metadata", {
+            format: "macho",
+            undecodedContent: true,
+        });
+    }
+    if (!table.wide)
+        throw new BinaryFormatFailure("unsupported", "Unsupported 32-bit Mach-O metadata", {
+            format: "macho",
+            undecodedContent: true,
+        });
+    const issue = machoCommandTableIssue(table, selectedBytes.length);
+    if (issue !== null)
+        throw malformedInput("macho", issue.kind === "extent"
+            ? "Malformed Mach-O command bounds"
+            : issue.message);
+    const state = {
+        slice,
+        sliceEnd,
+        segments: [],
+        mappings: [],
+        zeroFills: [],
+        sections: [],
+        dylibs: [],
+        binds: [],
+        rebases: [],
+        chained: null,
+        dyldInfo: false,
+        baseAddress: undefined,
+    };
+    const framing = new MachoLoadCommandCursor(table);
+    while (framing.nextOffset !== null) {
+        const cursor = slice + table.headerSize + framing.nextOffset;
+        const frame = framing.read(bytes.subarray(cursor, cursor + 8));
+        if (!frame.ok)
+            throw malformedInput("macho", frame.error);
+        const command = {
+            cursor,
+            kind: frame.value.command,
+            size: frame.value.size,
+        };
+        if (command.kind === LC.SEGMENT)
+            throw malformedInput("macho", "Mach-O segment command does not match the header width");
+        if (command.kind === LC.SEGMENT_64)
+            collectSegment(bytes, command, state);
+        else
+            collectFixupCommand(bytes, command, state);
+    }
+    const complete = framing.finish();
+    if (!complete.ok)
+        throw malformedInput("macho", complete.error);
+    const { segments, sections, chained, binds, rebases, dylibs } = state;
+    const mappings = createFileMappingIndex(state.mappings, state.zeroFills);
+    const offset = (address, size = 1) => {
+        try {
+            return mappings.offset(address, size);
+        }
+        catch (cause) {
+            // Metadata consumers retain partial facts when a pointer is unavailable.
+            // Mapping interpretation belongs to the shared image reader, including
+            // aliases that only overlap part of the span.
+            if (!(cause instanceof BinaryFormatFailure))
+                throw cause;
+            throw malformedInput("macho", `Unmapped or ambiguous metadata pointer ${hex(address)}`, { cause });
+        }
+    };
+    return {
+        segments,
+        sections,
+        selectedImage: {
+            container: fat === null ? "thin" : "fat",
+            offset: slice,
+            byteLength: sliceEnd - slice,
+            cpuType,
+            cpuSubtype,
+            containerTableSha256: fat?.container_table_sha256 ?? null,
+        },
+        offset,
+        fixups: { chained, binds, rebases, dylibs },
+        baseAddress: state.baseAddress ?? 0n,
+    };
+};
+/** Record an `LC_SEGMENT_64` and its section table. */
+const collectSegment = (bytes, { cursor, size }, state) => {
+    const parsed = readMachoSegmentHeader(bytes.subarray(cursor, cursor + size), true, true);
+    if (!parsed.ok)
+        throw truncatedInput("macho", "Truncated segment command");
+    const { address, nameBytes, fileSize, fileOffset, protection, sectionCount: count, headerSize, } = parsed.value;
+    const admitted = admitMachoSegmentMapping(parsed.value, 64);
+    if (!admitted.ok)
+        throw malformedInput("macho", admitted.error.message);
+    const { unmapped, fileAddress, zeroFill } = admitted.value;
+    if (fileOffset + fileSize > BigInt(state.sliceEnd - state.slice))
+        throw malformedInput("macho", "Segment file range exceeds target bytes");
+    const name = decodeMachoFixedName(nameBytes);
+    state.segments.push({
+        address: fileAddress,
+        ...(fileAddress === address ? {} : { declaredAddress: address }),
+        size: fileSize,
+        offset: state.slice + Number(fileOffset),
+        executable: (protection & 4) !== 0,
+    });
+    if (!unmapped && name !== "__PAGEZERO")
+        state.mappings.push({
+            address: fileAddress,
+            size: Number(fileSize),
+            offset: state.slice + Number(fileOffset),
+        });
+    if (zeroFill !== null && name !== "__PAGEZERO")
+        state.zeroFills.push(zeroFill);
+    if (!unmapped && name !== "__PAGEZERO" && fileOffset === 0n && fileSize > 0n)
+        state.baseAddress ??= fileAddress;
+    if (!machoSegmentSectionTableFits(parsed.value, size, true))
+        throw truncatedInput("macho", "Truncated section table");
+    const sectionWidth = machoSectionHeaderSize(true);
+    for (let section = 0; section < count; section++) {
+        const position = cursor + headerSize + section * sectionWidth;
+        const parsedSection = readMachoSectionHeader(bytes.subarray(position, position + sectionWidth), true, true);
+        if (!parsedSection.ok)
+            throw truncatedInput("macho", "Truncated section table");
+        const { nameBytes, address, size: sectionSize } = parsedSection.value;
+        if (sectionSize > BigInt(Number.MAX_SAFE_INTEGER))
+            throw malformedInput("macho", "Section size exceeds exact numeric range");
+        state.sections.push({
+            name: decodeMachoFixedName(nameBytes),
+            address,
+            size: Number(sectionSize),
+        });
+    }
+};
+/** Record fixup data ranges and dylib install names from one load command. */
+const collectFixupCommand = (bytes, { cursor, kind, size }, state) => {
+    const range = (relativeOffset, length) => {
+        const offset = state.slice + relativeOffset;
+        if (offset + length > state.sliceEnd)
+            throw malformedInput("macho", "Fixup data exceeds the Mach-O slice");
+        return { offset, size: length };
+    };
+    // An image has one fixup table of each kind; with a repeat, neither table
+    // is the image's, so the slice is refused rather than read by position.
+    if (kind === LC.DYLD_CHAINED_FIXUPS) {
+        const data = readMachoLinkeditDataCommand(kind, bytes.subarray(cursor, cursor + size), true);
+        if (data === null)
+            throw truncatedInput("macho", "Truncated chained-fixups command");
+        if (state.chained !== null)
+            throw malformedInput("macho", "Mach-O slice declares more than one LC_DYLD_CHAINED_FIXUPS command");
+        state.chained = range(data.dataOffset, data.dataSize);
+    }
+    else if (kind === LC.DYLD_INFO || kind === LC.DYLD_INFO_ONLY) {
+        const fields = readMachoDyldInfoCommand(bytes.subarray(cursor, cursor + size), true);
+        if (fields === null)
+            throw truncatedInput("macho", "Truncated dyld-info command");
+        if (state.dyldInfo)
+            throw malformedInput("macho", "Mach-O slice declares more than one LC_DYLD_INFO or LC_DYLD_INFO_ONLY command");
+        state.dyldInfo = true;
+        const rebase = range(fields.rebase_off, fields.rebase_size);
+        if (rebase.size > 0)
+            state.rebases.push(rebase);
+        for (const [stream, offset, length] of [
+            ["bind", fields.bind_off, fields.bind_size],
+            ["weak", fields.weak_bind_off, fields.weak_bind_size],
+            ["lazy", fields.lazy_bind_off, fields.lazy_bind_size],
+        ]) {
+            const bound = range(offset, length);
+            if (bound.size > 0)
+                state.binds.push({ ...bound, stream });
+        }
+    }
+    else if (machoDependencyCommand(kind) !== null) {
+        const parsed = readMachoDylibCommandFacts(bytes.subarray(cursor, cursor + size), kind, true);
+        if (!parsed.ok) {
+            if (parsed.error._tag === "InvalidMachoDylibCommand")
+                throw truncatedInput("macho", "Truncated dylib command");
+            if (parsed.error.reason === "unterminated")
+                throw truncatedInput("macho", "Unterminated dylib install name");
+            throw malformedInput("macho", "Dylib install name is outside its load command");
+        }
+        const { nameBytes } = parsed.value;
+        state.dylibs.push(decodeMachoName(Buffer.from(nameBytes.buffer, nameBytes.byteOffset, nameBytes.byteLength)));
+    }
+};

@@ -1,0 +1,173 @@
+import { resolveEvidenceInput, resolvePairedEvidenceSources, } from "../EvidenceInputResolver.js";
+import { AnalysisError } from "../../domain/analysisErrorBase.js";
+import { AnalysisInputError } from "../../domain/analysisErrorCore.js";
+import { inspectAnalysisViewValidated } from "../analysisView/AnalysisViewService.js";
+import { artifactComparisonInputSchema } from "../../contracts/artifactComparisonContracts.js";
+import { parseAnalysisInput } from "../AnalysisInput.js";
+import { artifactInventorySummaryViewResultSchema } from "../../domain/analysisView/analysisViewResult.js";
+import { compareArtifacts, } from "../../domain/artifactComparison.js";
+import { ARTIFACT_COMPARISON_PROVIDER } from "../../domain/comparisonEvidenceIdentity.js";
+import { EvidenceIntegrityError, EvidenceReferenceError, } from "../../domain/evidenceErrors.js";
+import { createEvidence, evidenceSubjectTarget, evidenceTargetIdentity, rebindEvidenceToTargetPath, } from "../../domain/evidence.js";
+import { readEvidence } from "../../domain/evidenceValidation.js";
+import { RECREATE_EVIDENCE_GUIDANCE } from "../../domain/evidenceFormat.js";
+import { err, ok } from "../../domain/result.js";
+import { sameTargetIdentity, unknownTarget, } from "../../domain/targetIdentity.js";
+const OPERATION = "compare_artifacts";
+/**
+ * Select both sides through the shared paired-source owner, authenticate them,
+ * then resolve a summary to its exact retained parent inventory.
+ */
+export const resolveArtifactComparisonSources = async (input, evidenceById, options = {}) => {
+    const request = parseAnalysisInput(OPERATION, input, artifactComparisonInputSchema, options.signal);
+    if (!request.ok)
+        return request;
+    return resolvePairedEvidenceSources(request.value, evidenceById, {
+        ...options,
+        operation: OPERATION,
+        resolveEvidence: (candidate, related, side) => {
+            const authenticated = readEvidence(candidate);
+            return authenticated.ok
+                ? resolveArtifactComparisonEvidence(authenticated.value, related, [
+                    side,
+                ])
+                : authenticated;
+        },
+    });
+};
+/** Compare resolved inventories and derive Evidence citing both complete owners. */
+export const compareArtifactEvidence = ({ left, right, }) => {
+    let comparison;
+    try {
+        comparison = compareArtifacts(left, right);
+    }
+    catch (cause) {
+        // Typed causes already name the failed constraint; keep their issues.
+        if (cause instanceof AnalysisError)
+            return err(cause);
+        throw cause;
+    }
+    const leftEvidenceIds = [left.evidence_id];
+    const rightEvidenceIds = [right.evidence_id];
+    return ok({
+        comparison,
+        evidence: createEvidence(unknownTarget("derived-from-linked-evidence"), ARTIFACT_COMPARISON_PROVIDER, {
+            predicateType: "rea.artifact-comparison",
+            operation: OPERATION,
+            parameters: {
+                left_evidence_ids: leftEvidenceIds,
+                right_evidence_ids: rightEvidenceIds,
+            },
+            result: comparison,
+            confidence: "derived",
+            authority: "analyst-inference",
+            limitations: comparison.limitations,
+            evidenceLinks: [...leftEvidenceIds, ...rightEvidenceIds],
+        }),
+    });
+};
+/**
+ * Resolve an already-authenticated artifact summary's exact retained owner.
+ * The caller must authenticate the supplied Evidence before invoking this helper.
+ */
+export const resolveArtifactComparisonEvidence = (evidence, evidenceById, path = []) => {
+    if (evidence.operation !== "inspect_analysis_view")
+        return ok(evidence);
+    const summary = artifactInventorySummaryViewResultSchema.safeParse(evidence.normalized_result);
+    if (!summary.success)
+        return err(new AnalysisInputError(OPERATION, undefined, [
+            {
+                path: [...path],
+                reason: "invalid_value",
+                message: "Artifact comparison accepts only an artifact inventory summary from inspect_analysis_view.",
+            },
+        ]));
+    const parentId = summary.data.parent_evidence_id;
+    const parent = evidenceById?.(parentId);
+    if (parent === undefined)
+        return err(new EvidenceReferenceError(parentId, "missing", {
+            expected: "retained complete artifact inventory Evidence",
+            actual: null,
+        }));
+    const selected = resolveEvidenceInput({ kind: "retained-evidence", evidence_id: parentId }, () => parent);
+    if (!selected.ok)
+        return selected;
+    const authenticated = readEvidence(selected.value);
+    if (!authenticated.ok)
+        return authenticated;
+    const owner = authenticated.value;
+    const identity = evidenceTargetIdentity(evidence);
+    const ownerIdentity = evidenceTargetIdentity(owner);
+    const target = evidenceSubjectTarget(evidence.subject);
+    if (identity === null ||
+        ownerIdentity === null ||
+        target === undefined ||
+        !sameTargetIdentity(identity, ownerIdentity))
+        return mismatch();
+    // The ledger preserves its original display path; summary delivery may use a
+    // later caller-selected alias for this same authenticated owner identity.
+    // The alias names the whole target, selection included.
+    const { name: _name, ...aliasTarget } = target;
+    const presentation = rebindEvidenceToTargetPath(owner, {
+        ...aliasTarget,
+        path: summary.data.artifact.path,
+    });
+    const reprojected = inspectAnalysisViewValidated({
+        source: { kind: "retained-evidence", evidence_id: parentId },
+        view: { kind: "summary" },
+    }, (evidenceId) => (evidenceId === parentId ? presentation : undefined));
+    if (!reprojected.ok)
+        return reprojected;
+    // Only the current format's projection identifies the summary; the format
+    // owner refuses earlier projections instead of rebuilding them.
+    if (reprojected.value.evidence_id !== evidence.evidence_id)
+        return mismatch();
+    return ok(owner);
+};
+const mismatch = () => err(new EvidenceIntegrityError(`Artifact summary does not match its retained parent inventory. A summary from an earlier Evidence format no longer matches. ${RECREATE_EVIDENCE_GUIDANCE}`));
+/**
+ * Compare resolved inventories for a session: the derived Evidence, both
+ * sources to retain, and the residual question a changed, unknown or
+ * truncated comparison leaves.
+ */
+export const artifactComparisonExecution = (sources) => {
+    const compared = compareArtifactEvidence(sources);
+    if (!compared.ok)
+        return compared;
+    const { left, right } = sources;
+    const { comparison, evidence } = compared.value;
+    return ok({
+        evidence,
+        sources: [left, right],
+        unknown: artifactUnknownInput(left, right, comparison, evidence.evidence_id),
+    });
+};
+const artifactUnknownInput = (left, right, comparison, comparisonEvidenceId) => {
+    const { status } = comparison;
+    if (status === "unchanged")
+        return undefined;
+    const sourceIds = [...new Set([left.evidence_id, right.evidence_id])];
+    // optional-fact-default: legacy absence names no side; content contradictions apply.
+    const contradictingIds = comparison.integrity_mismatch_evidence_ids ?? [];
+    const contentContradictions = status === "changed" && left.evidence_id !== right.evidence_id
+        ? [right.evidence_id]
+        : [];
+    const contradictions = contradictingIds.length > 0 ? contradictingIds : contentContradictions;
+    return {
+        question: `Artifact comparison is ${status} (comparison ${comparisonEvidenceId})`,
+        severity: status === "unknown" || status === "truncated" ? "high" : "medium",
+        domain: "artifact-comparison",
+        supporting_evidence_ids: sourceIds.filter((id) => !contradictions.includes(id)),
+        contradicting_evidence_ids: contradictions,
+        required_authority: "shipped-artifact",
+        required_confidence: "observed",
+        required_environment: null,
+        recommended_probes: [
+            {
+                operation: "inspect_artifact",
+                rationale: "Inspect both artifacts and compare their complete graphs.",
+            },
+        ],
+        relationships: [],
+    };
+};

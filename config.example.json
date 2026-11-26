@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "vscode": {
+      "type": "http",
+      "url": "http://127.0.0.1:9876/mcp"
+    },
+    "rea": {
+      "command": "node",
+      "args": [
+        "vendor/rea-agents/scripts/rea.mjs",
+        "mcp"
+      ]
+    }
+  }
+}

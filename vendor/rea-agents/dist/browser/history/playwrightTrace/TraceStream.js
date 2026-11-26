@@ -1,0 +1,202 @@
+import { decodeStrictUtf8 } from "../../../domain/strictUtf8.js";
+import { fixedAllowanceOptions } from "../../../domain/fixedAllowanceRemediation.js";
+import { getHeapStatistics } from "node:v8";
+import { LosslessNumber, isSafeNumber } from "lossless-json";
+import { AnalysisResourceConstraintError, AnalysisUnsupportedTargetError, } from "../../../domain/analysisErrorCore.js";
+import { isParseLimit, parseLimitConstraint, } from "../../../domain/parseFailureAnalysisError.js";
+import { PLAYWRIGHT_TRACE_OPERATION, PLAYWRIGHT_TRACE_LIMITS, } from "../../../domain/playwrightTrace/playwrightTrace.js";
+import { captureObject } from "../CaptureRedaction.js";
+import { CAPTURE_FORMAT, CAPTURE_LIMITS, CaptureFormatError, } from "../CaptureFormatError.js";
+import { parseCaptureJson } from "../CaptureJson.js";
+import { TraceInventory, traceIdentity } from "./TraceInventory.js";
+import { traceLines } from "./TraceLines.js";
+import { projectTraceEvent } from "./TraceEventProjection.js";
+const text = (value) => (typeof value === "string" ? value : null);
+const number = (value) => value instanceof LosslessNumber && isSafeNumber(value.value)
+    ? Number(value.value)
+    : null;
+const readRecord = (bytes) => {
+    const required = 32 * 1024 * 1024 + bytes.length * 64;
+    if (required > getHeapStatistics().total_available_size)
+        throw new AnalysisResourceConstraintError(PLAYWRIGHT_TRACE_OPERATION, "memory", "Insufficient heap headroom for trace record expansion.", { input_bytes: bytes.length, required_headroom_bytes: required }, { measuredExhaustion: true });
+    let value;
+    try {
+        value = decodeStrictUtf8(bytes, "preserve");
+    }
+    catch (cause) {
+        throw new CaptureFormatError("malformed", "Trace line is not valid UTF-8.", "", cause);
+    }
+    return parseCaptureJson(value, "Playwright trace", PLAYWRIGHT_TRACE_LIMITS.factsBytes / 256);
+};
+const hasPartialHeadline = (event) => (event.kind === "network" &&
+    (event.method === null || event.url === null || event.status === null)) ||
+    (event.kind === "console" && event.text === null) ||
+    (event.kind === "action-before" && event.method === null) ||
+    (event.kind === "screenshot" && event.resource_references.length === 0);
+/** A member's facts remain provisional until its ZIP stream verifies CRC and size. */
+class TraceStreamRead {
+    input;
+    stream;
+    pending = [];
+    diagnostics = [];
+    omitted = new Map();
+    #headerSeen = false;
+    constructor(input) {
+        this.input = input;
+        const { member, profileKnown } = input;
+        this.stream = {
+            stream_id: traceIdentity("trace_stream", member.member_id),
+            member_id: member.member_id,
+            role: member.path.endsWith(".network") ? "network" : "trace",
+            version: profileKnown ? 10 : null,
+            state: profileKnown ? "supported" : "unknown",
+            lines: 0,
+            supported_events: 0,
+            omitted_event_types: [],
+            producer: null,
+        };
+    }
+    diagnostic(line, code, message) {
+        this.input.inventory.reserve(1024);
+        this.diagnostics.push({ line, code, message });
+    }
+    header(raw, line) {
+        const { inventory } = this.input;
+        this.#headerSeen = true;
+        if (!captureObject(raw) || raw.type !== "context-options") {
+            this.diagnostic(line, "missing-context-header", "A trace member has no initial context-options record; its event version stays unknown.");
+            return;
+        }
+        const version = number(raw.version);
+        if (version !== null && version !== 10)
+            throw new AnalysisUnsupportedTargetError(PLAYWRIGHT_TRACE_OPERATION, inventory.artifact.path, "Only Playwright trace version 10 is supported.");
+        if (version !== 10) {
+            this.diagnostic(line, "unknown-version", "The context header does not declare numeric trace version 10.");
+            return;
+        }
+        this.stream.version = 10;
+        this.stream.state = "supported";
+        this.stream.producer = {
+            playwright_version: text(raw.playwrightVersion),
+            browser_name: text(raw.browserName),
+            origin: text(raw.origin),
+        };
+        inventory.retain(this.stream.producer);
+    }
+    record(line) {
+        const { inventory, member } = this.input;
+        let raw;
+        try {
+            raw = readRecord(line.bytes);
+        }
+        catch (cause) {
+            if (!(cause instanceof CaptureFormatError))
+                throw cause;
+            if (isParseLimit(cause, CAPTURE_FORMAT)) {
+                const { name, maximum } = cause.failure.limit;
+                if (name !== "nesting-depth" && name !== "parser-nodes")
+                    throw cause;
+                const nesting = name === "nesting-depth";
+                throw parseLimitConstraint(PLAYWRIGHT_TRACE_OPERATION, "memory", cause, {
+                    reportedLimitContext: {
+                        [nesting ? "nesting_levels" : "parser_nodes"]: maximum,
+                    },
+                    ...fixedAllowanceOptions(nesting
+                        ? "The Playwright trace record nesting allowance"
+                        : "The Playwright trace record parser allowance", "parser", {
+                        limit: maximum,
+                        unit: CAPTURE_LIMITS[name].unit,
+                    }),
+                });
+            }
+            this.diagnostic(line.line, "malformed-record", cause.message);
+            this.#headerSeen = true;
+            return;
+        }
+        if (this.stream.role === "trace" && !this.#headerSeen) {
+            this.header(raw, line.line);
+            return;
+        }
+        if (!captureObject(raw) || typeof raw.type !== "string") {
+            this.diagnostic(line.line, "malformed-record", "An event must be an object with a type string.");
+            return;
+        }
+        if (raw.type === "context-options") {
+            this.stream.state = "unknown";
+            this.diagnostic(line.line, "duplicate-context-header", "Repeated context headers make the remaining stream version unknown; later events are not interpreted.");
+            return;
+        }
+        let event;
+        try {
+            event = projectTraceEvent(raw, {
+                event_id: traceIdentity("trace_event", [member.member_id, line.line]),
+                stream_id: this.stream.stream_id,
+                ordinal: line.line - 1,
+                source: {
+                    member_id: member.member_id,
+                    line: line.line,
+                    record_pointer: raw.type === "resource-snapshot" ? "/snapshot" : "",
+                },
+            });
+        }
+        catch (cause) {
+            if (!(cause instanceof CaptureFormatError))
+                throw cause;
+            this.diagnostic(line.line, "malformed-record", cause.message);
+            return;
+        }
+        if (event !== undefined) {
+            inventory.reserve(event.resource_references.length * 512);
+            inventory.retain(event);
+            this.pending.push(event);
+            const partial = hasPartialHeadline(event);
+            if (partial)
+                this.diagnostic(line.line, "partial-event", "Selected headline fields are unavailable; known facts remain retained without assuming absent values.");
+            return;
+        }
+        if (!this.omitted.has(raw.type))
+            inventory.reserve(512 + raw.type.length * 12);
+        this.omitted.set(raw.type, (this.omitted.get(raw.type) ?? 0) + 1);
+        if ([
+            "before",
+            "after",
+            "console",
+            "resource-snapshot",
+            "screencast-frame",
+        ].includes(raw.type))
+            this.diagnostic(line.line, "malformed-event", "A supported event is missing its required payload identity.");
+    }
+    async read() {
+        const { inventory, reader, entry, member, budget, signal } = this.input;
+        if (entry.kind !== "file" || entry.encrypted) {
+            this.stream.state = "unavailable";
+            inventory.diagnostic(member, null, "unavailable-stream", "A selected stream is encrypted or is not a regular archive member.");
+            return this.stream;
+        }
+        const content = await reader.open(entry, signal);
+        for await (const line of traceLines(content, budget, signal)) {
+            this.stream.lines = line.line;
+            if (line.bytes.length === 0)
+                continue;
+            if (this.stream.role === "network" && this.stream.state !== "supported")
+                continue;
+            if (this.stream.role === "trace" &&
+                this.#headerSeen &&
+                this.stream.state !== "supported")
+                continue;
+            this.record(line);
+        }
+        member.decoded = true;
+        if (this.stream.version === null)
+            inventory.diagnostic(member, null, "unknown-stream-version", "This stream has no unambiguous v10 trace profile; its events were not interpreted.");
+        for (const diagnostic of this.diagnostics)
+            inventory.diagnostic(member, diagnostic.line, diagnostic.code, diagnostic.message);
+        this.stream.supported_events = this.pending.length;
+        this.stream.omitted_event_types = Array.from(this.omitted, ([type, count]) => ({ type, count }));
+        inventory.retain(this.stream);
+        for (const event of this.pending)
+            inventory.events.push(event);
+        return this.stream;
+    }
+}
+export const readTraceStream = (input) => new TraceStreamRead(input).read();

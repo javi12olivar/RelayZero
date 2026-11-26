@@ -1,0 +1,228 @@
+import { Readable } from "node:stream";
+import { finished, pipeline } from "node:stream/promises";
+import { createInflateRaw } from "node:zlib";
+import { DEFAULT_DOTNET_BUNDLE_READER_LIMITS, } from "../domain/artifactReaderLimits.js";
+import { ArtifactResourceScope, ArtifactReaderFailure, assertProducedEntry, copyArtifactEntry, readArtifactFileChunks, abortIfNeeded, ArtifactFileSource, } from "../resources/index.js";
+import { findDotnetBundleHeader, readDotnetBundle, } from "./dotnet/DotnetBundle.js";
+/** Stable, range-streamed .NET bundle reader; extraction paths remain owned by SafeOutputTree. */
+export class DotnetBundleArtifactReader {
+    limits;
+    format = "dotnet-bundle";
+    #source;
+    #scope = new ArtifactResourceScope();
+    #admission;
+    #bundle;
+    #closed = false;
+    #entries = new Map();
+    #streams = new Set();
+    constructor(path, admitted, limits = DEFAULT_DOTNET_BUNDLE_READER_LIMITS) {
+        this.limits = limits;
+        if (admitted !== undefined && "kind" in admitted) {
+            this.#admission = admitted;
+            this.#source = new ArtifactFileSource(path, ".NET bundle", admitted.source);
+        }
+        else
+            this.#source = new ArtifactFileSource(path, ".NET bundle", admitted);
+    }
+    /** Bind extraction to the whole host that produced its inventory snapshot. */
+    async prepareContainer(expectedSha256, signal) {
+        await this.#scope.run(async () => {
+            this.#assertOpen(signal);
+            await this.#source.bindSelectedPathSha256(expectedSha256, signal);
+        });
+    }
+    async *entries(signal, options) {
+        const bundle = await this.#scope.run(async () => {
+            this.#assertOpen(signal);
+            const source = await this.#source.readSelectedPath(signal);
+            if (this.#bundle === undefined) {
+                const header = this.#admission?.headerOffset ??
+                    (await findDotnetBundleHeader(source.handle, source.initial.size, signal));
+                if (header === undefined)
+                    throw new ArtifactReaderFailure("format", "Selected file has no .NET bundle header");
+                this.#bundle = await readDotnetBundle(source.handle, source.initial.size, header, signal, this.limits);
+                this.#admission = undefined;
+            }
+            await this.#source.readSelectedPath(signal);
+            return this.#bundle;
+        });
+        this.#entries.clear();
+        for (const [index, file] of bundle.files.entries()) {
+            this.#assertOpen(signal);
+            const entry = {
+                path: file.path,
+                kind: "file",
+                declaredSize: file.size,
+                compressedSize: file.compressedSize || null,
+                byteOffset: file.offset,
+                byteLength: file.storedSize,
+                executable: false,
+                encrypted: false,
+                declaredIntegrity: null,
+                unpacked: false,
+                adapterKey: String(index),
+                formatMetadata: {
+                    kind: "dotnet-bundle-entry",
+                    major_version: bundle.majorVersion,
+                    minor_version: bundle.minorVersion,
+                    file_type: file.fileType,
+                },
+                limitations: [
+                    ".NET bundle file types are declarations, not proof of assembly validity or executable authority.",
+                    ...(file.fileType > 5
+                        ? [
+                            `Unknown .NET bundle file type ${file.fileType}; bytes are retained without interpreting the type.`,
+                        ]
+                        : []),
+                ],
+            };
+            this.#entries.set(entry.adapterKey, {
+                entry: copyArtifactEntry(entry),
+                file,
+            });
+            yield entry;
+        }
+        await this.#source.readSelectedPath(signal);
+        // Every manifest file is listed; manifest damage fails the traversal.
+        options?.onCoverage?.({ status: "complete", limitations: [] });
+    }
+    async open(entry, signal) {
+        return this.#scope.run(async () => {
+            this.#assertOpen(signal);
+            const source = await this.#source.readSelectedPath(signal);
+            this.#assertOpen(signal);
+            const selected = this.#entries.get(entry.adapterKey);
+            assertProducedEntry(entry, selected?.entry, "Selected .NET bundle entry differs from its observed manifest");
+            let inputStream;
+            let decodedStream;
+            let finalizing = false;
+            const onFailure = (cause) => {
+                stream.destroy(this.#memberFailure(selected.file, decodedStream?.errored ?? cause));
+            };
+            const observeSource = (input, decoded) => {
+                inputStream = input;
+                decodedStream = decoded;
+                input.on("error", onFailure);
+                if (decoded !== input)
+                    decoded.on("error", onFailure);
+                // The descriptor owner observes abort first and retains in-flight I/O
+                // failures, even while this iterator is suspended at a yield.
+                signal?.removeEventListener("abort", onAbort);
+                signal?.addEventListener("abort", onAbort, { once: true });
+                if (signal?.aborted)
+                    onAbort();
+            };
+            const stream = Readable.from(this.#readMember(source, selected.file, {
+                source: observeSource,
+                failure: onFailure,
+                finalizing: () => {
+                    finalizing = true;
+                },
+            }, signal), { objectMode: false });
+            const onAbort = () => {
+                if (stream.destroyed || finalizing)
+                    return;
+                if (inputStream !== undefined && !inputStream.destroyed)
+                    return;
+                onFailure(inputStream?.errored ??
+                    new ArtifactReaderFailure("cancelled", ".NET bundle read cancelled", {
+                        cause: signal?.reason,
+                    }));
+            };
+            stream.on("error", () => undefined);
+            this.#streams.add(stream);
+            stream.once("close", () => {
+                this.#streams.delete(stream);
+                signal?.removeEventListener("abort", onAbort);
+                inputStream?.removeListener("error", onFailure);
+                if (decodedStream !== inputStream)
+                    decodedStream?.removeListener("error", onFailure);
+            });
+            signal?.addEventListener("abort", onAbort, { once: true });
+            if (signal?.aborted)
+                onAbort();
+            return stream;
+        });
+    }
+    provenance() {
+        return [];
+    }
+    async close() {
+        this.#closed = true;
+        for (const stream of this.#streams)
+            stream.destroy();
+        await this.#scope.close();
+        await Promise.all([...this.#streams].map((stream) => finished(stream).catch(() => undefined)));
+        await this.#source.close();
+        this.#entries.clear();
+        this.#admission = undefined;
+        this.#bundle = undefined;
+    }
+    #assertOpen(signal) {
+        abortIfNeeded(signal);
+        if (this.#closed)
+            throw new ArtifactReaderFailure("unavailable", ".NET bundle reader is closed");
+    }
+    async *#readMember(source, file, lifecycle, signal) {
+        const storedBytes = file.storedSize;
+        const input = storedBytes === 0
+            ? Readable.from([])
+            : readArtifactFileChunks(source.handle, {
+                start: file.offset,
+                end: file.offset + storedBytes - 1,
+                signal,
+            });
+        const inflater = file.compressedSize === 0 ? undefined : createInflateRaw();
+        const decoded = inflater ?? input;
+        lifecycle.source(input, decoded);
+        const pumping = inflater === undefined ? undefined : pipeline(input, inflater);
+        // Observe early pipeline rejections while the output iterator is still reading.
+        void pumping?.catch(() => undefined);
+        let bytes = 0;
+        try {
+            for await (const raw of decoded) {
+                try {
+                    abortIfNeeded(signal);
+                    const chunk = raw;
+                    bytes += chunk.length;
+                    if (bytes > file.size)
+                        throw new ArtifactReaderFailure("limit", `.NET bundle entry expands beyond its declared size: ${file.path}`);
+                    yield chunk;
+                }
+                catch (cause) {
+                    // Iterator cleanup can emit AbortError. Retain the failure that
+                    // caused this body to exit, including the caller's cancellation.
+                    lifecycle.failure(cause);
+                    throw cause;
+                }
+            }
+            // Final source validation owns its in-flight I/O before late cancellation.
+            lifecycle.finalizing();
+            await pumping;
+            if (bytes !== file.size ||
+                (inflater !== undefined && inflater.bytesWritten !== storedBytes))
+                throw new ArtifactReaderFailure("format", `.NET bundle member length or compressed extent does not match its declaration: ${file.path}`);
+            await this.#source.readSelectedPath(signal);
+            abortIfNeeded(signal);
+        }
+        catch (cause) {
+            const failure = this.#memberFailure(file, cause);
+            lifecycle.failure(failure);
+            throw failure;
+        }
+        finally {
+            input.destroy();
+            decoded.destroy();
+            await pumping?.catch(() => undefined);
+        }
+    }
+    #memberFailure(file, cause) {
+        if (cause instanceof ArtifactReaderFailure)
+            return cause;
+        const malformedCompression = file.compressedSize !== 0 &&
+            cause instanceof Error &&
+            "code" in cause &&
+            ["Z_DATA_ERROR", "Z_BUF_ERROR"].includes(String(cause.code));
+        return new ArtifactReaderFailure(malformedCompression ? "format" : "io", `Could not read .NET bundle member: ${file.path}`, { cause });
+    }
+}

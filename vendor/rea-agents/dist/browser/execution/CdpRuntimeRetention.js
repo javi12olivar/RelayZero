@@ -1,0 +1,37 @@
+import { AnalysisResourceConstraintError } from "../../domain/analysisErrorCore.js";
+import { Budget } from "../../domain/budget.js";
+import { fixedAllowanceOptions } from "../../domain/fixedAllowanceRemediation.js";
+import { WEB_RUNTIME_LIMITS } from "../../domain/webRuntime.js";
+const retentionLimit = (kind) => kind === "sources"
+    ? WEB_RUNTIME_LIMITS.sourceBytes
+    : WEB_RUNTIME_LIMITS.retainedEventBytes;
+const retentionExceeded = (operation, kind, retainedBytes) => {
+    const limit = retentionLimit(kind);
+    const allowance = `Complete browser runtime ${kind} retention`;
+    return new AnalysisResourceConstraintError(operation, "capacity", `${allowance} (${String(limit)} bytes) exceeded; no partial runtime result is returned.`, {
+        boundary: "browser-runtime-retention",
+        kind,
+        retained_bytes: retainedBytes,
+        limit_bytes: limit,
+    }, fixedAllowanceOptions(allowance, "live", { limit, unit: "bytes" }));
+};
+/** Enforce the retained runtime representation, separately from wire payloads. */
+export const assertRuntimeRetention = (operation, kind, retainedBytes) => {
+    if (retainedBytes > retentionLimit(kind))
+        throw retentionExceeded(operation, kind, retainedBytes);
+};
+/** Cumulative retention of one runtime kind across a capture. */
+export class RuntimeRetention {
+    operation;
+    kind;
+    #bytes;
+    constructor(operation, kind) {
+        this.operation = operation;
+        this.kind = kind;
+        this.#bytes = new Budget(retentionLimit(kind));
+    }
+    /** Charge `bytes` before retaining them, or throw the retention failure. */
+    charge(bytes) {
+        this.#bytes.charge(bytes, () => retentionExceeded(this.operation, this.kind, this.#bytes.used + bytes));
+    }
+}

@@ -1,0 +1,49 @@
+# Build output and dependencies
+node_modules/
+/dist/
+/build/
+/release/
+
+# Runtime state and local data
+logs/
+chrome-profile/
+profile/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+
+# Python and editor files
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.vscode/
+.idea/
+
+# Local secrets and environment files
+.env
+.env.*
+!.env.example
+config.json
+*.pem
+*.key
+credentials.json
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local backups and scratch files
+*.bak
+*.pre-*.bak
+_zs_*
+
+# Local packaging artifacts
+*.tmp
+*.crash
+*.dmp
+*.msi
+*.exe
+*.zip

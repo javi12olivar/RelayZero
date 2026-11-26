@@ -1,0 +1,86 @@
+import { t as __esmMin } from "./rolldown-runtime-BjeaiXFo.js";
+import { n as init_errorMessage, t as errorMessage } from "./errorMessage-rfGn5D1_.js";
+import { ar as withOwnedRegularFile, cr as RegularFileChangedError, dr as assertStableRegularFileIdentity, er as RegularFileCancelled, fr as init_RegularFile, hr as regularFileState, lr as RegularFileOperationCancelled, nr as init_OwnedRegularFile, tr as RegularFileCleanupFailure, ur as assertRegularFileActive } from "./resources-C5FMDwcC.js";
+import { createHash } from "node:crypto";
+
+//#region dist/filesystem/StableFileHash.js
+async function readStableFile(path, options, includePrefix) {
+	try {
+		return await withOwnedRegularFile(path, options, async (source) => {
+			const { prefix, ...fingerprint } = await hashStableRegularFileDescriptor(source, path, {
+				symlinks: "follow",
+				prefixBytes: includePrefix ? STABLE_FILE_PREFIX_BYTES : 0,
+				...options.signal === undefined ? {} : { signal: options.signal }
+			});
+			return includePrefix ? {
+				...fingerprint,
+				prefix,
+				state: regularFileState(source.initial)
+			} : fingerprint;
+		});
+	} catch (cause) {
+		if (cause instanceof RegularFileCleanupFailure || cause instanceof RegularFileCancelled || cause instanceof RegularFileOperationCancelled) throw cause;
+		throw new StableFileHashFailure(path, cause);
+	}
+}
+var STABLE_FILE_PREFIX_BYTES, StableFileHashFailure, stableFileHashCause, hashStableFile, observeStableFile, hashStableRegularFileDescriptor;
+function init_StableFileHash() {
+	return (init_StableFileHash = __esmMin((() => {
+		init_OwnedRegularFile();
+		init_RegularFile();
+		init_errorMessage();
+		STABLE_FILE_PREFIX_BYTES = 2;
+		StableFileHashFailure = class extends Error {
+			path;
+			cause;
+			_tag = "StableFileHashFailure";
+			constructor(path, cause) {
+				super(`Could not hash ${path}: ${errorMessage(cause)}`, { cause });
+				this.path = path;
+				this.cause = cause;
+				this.name = this._tag;
+			}
+		};
+		stableFileHashCause = (cause) => cause instanceof StableFileHashFailure ? cause.cause : cause;
+		hashStableFile = async (path, options) => {
+			return await readStableFile(path, options, false);
+		};
+		observeStableFile = (path, options) => readStableFile(path, options, true);
+		hashStableRegularFileDescriptor = async ({ handle, initial }, path, options) => {
+			if (!Number.isSafeInteger(initial.size) || initial.size < 0) throw new RangeError(`Regular file size cannot be represented safely: ${path}`);
+			const hash = createHash("sha256");
+			const chunk = Buffer.allocUnsafe(64 * 1024);
+			const prefix = Buffer.alloc(Math.min(options.prefixBytes ?? 0, initial.size));
+			let position = 0;
+			while (position <= initial.size) {
+				assertRegularFileActive(options.signal);
+				const length = Math.min(chunk.length, initial.size - position + 1);
+				if (length <= 0) break;
+				const read = await handle.read(chunk, 0, length, position);
+				if (position + read.bytesRead > initial.size || read.bytesRead === 0 && position < initial.size) throw new RegularFileChangedError(path);
+				assertRegularFileActive(options.signal);
+				if (read.bytesRead === 0) break;
+				if (position < prefix.length) {
+					const prefixBytes = Math.min(read.bytesRead, prefix.length - position);
+					chunk.copy(prefix, position, 0, prefixBytes);
+				}
+				hash.update(chunk.subarray(0, read.bytesRead));
+				position += read.bytesRead;
+			}
+			assertRegularFileActive(options.signal);
+			if (position !== initial.size) throw new RegularFileChangedError(path);
+			await assertStableRegularFileIdentity(handle, path, initial, {
+				symlinks: options.symlinks,
+				...options.signal === undefined ? {} : { signal: options.signal }
+			});
+			return {
+				sha256: hash.digest("hex"),
+				bytes: position,
+				prefix
+			};
+		};
+	})))();
+}
+
+//#endregion
+export { observeStableFile as a, init_StableFileHash as i, hashStableFile as n, stableFileHashCause as o, hashStableRegularFileDescriptor as r, StableFileHashFailure as t };

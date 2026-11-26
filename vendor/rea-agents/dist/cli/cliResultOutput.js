@@ -1,0 +1,760 @@
+import { constants } from "node:buffer";
+import { estimateTokenCount } from "tokenx";
+import { analysisErrorProjectionSchema } from "../domain/analysisErrorProjectionSchema.js";
+import { cliOperationFailureIdentity, cliOperationFailurePayload, } from "../cliLogging.js";
+import { AnalysisInputError, AnalysisResourceConstraintError, } from "../domain/analysisErrorCore.js";
+import { hostRangeErrorKind } from "../domain/parseFailure.js";
+import { err, ok } from "../domain/result.js";
+import { sliceTextByTokenWindow } from "./tokenWindow.js";
+import { projectAnalysisError, } from "../domain/analysisErrorProjection.js";
+import { formatDelimitedOutputParts, formatCliOutput, prepareDelimitedOutput, delimitedOutputInputError, containsUnpairedSurrogate, containsUnrepresentableMarkdown, hasUnpairedSurrogate, } from "./cliOutputFormatter.js";
+import { cliEvidencePublicationReceipt, retainCliPublicationOnError, } from "./cliEvidencePublication.js";
+import { formatCliCallToAction } from "./outputEnvelope.js";
+import { jsonLinesErrorRecord } from "./jsonLines.js";
+import { writeCliJsonLines } from "./jsonLinesOutput.js";
+import { ToonOutputCleanupFailure, toonOutputCancellationStatus, writeToonOutput, } from "./toonOutput.js";
+import { analysisErrorWithCleanupDependencies } from "../domain/analysisErrorCleanup.js";
+import { jsonOutputParts, isTerminalOutput, writeJsonOutput, writeOutputParts, writeOutputText, } from "./jsonOutput.js";
+export { toonOutputCancellationStatus as cliOutputCancellationStatus } from "./toonOutput.js";
+/** The full-output envelope's metadata: the CLI's presentation, not the result. */
+const resultMeta = (metadata) => ({
+    command: metadata.command,
+    duration: metadata.duration,
+    ...(metadata.cta === undefined ? {} : { cta: metadata.cta }),
+    ...(metadata.cliControls === undefined
+        ? {}
+        : { cli_controls: { ...metadata.cliControls } }),
+});
+/** Own result presentation, streaming writes and formatting recovery. */
+export const createCliResultOutput = (initialOptions, destination) => {
+    let options = initialOptions;
+    if (!options.validation.ok)
+        return undefined;
+    let format = options.format;
+    let handled = false;
+    let failed = false;
+    let interrupted = false;
+    let error;
+    let completed;
+    const recoverFormattingFailure = async (cause) => {
+        // A rejected command never reaches write(). Destination failures retain
+        // handled ownership. Only a completed, unwritten result can be replaced.
+        const formattingCause = cause instanceof ToonOutputCleanupFailure
+            ? cause.outputFailure?.cause
+            : cause;
+        if (completed === undefined ||
+            handled ||
+            !(formattingCause instanceof Error))
+            return false;
+        const stringCapacity = hostRangeErrorKind(formattingCause) === "host-capacity" &&
+            formattingCause.message === "Invalid string length";
+        const systemCode = "code" in formattingCause ? formattingCause.code : undefined;
+        const stagingCapacity = format === "toon" &&
+            (systemCode === "ENOSPC" ||
+                systemCode === "EDQUOT" ||
+                systemCode === "EFBIG")
+            ? systemCode
+            : undefined;
+        if (!stringCapacity && stagingCapacity === undefined)
+            return false;
+        const { originalFailure } = completed;
+        const refusal = retainCliPublicationOnError(new AnalysisResourceConstraintError(completed.metadata.command, stagingCapacity === undefined ? "memory" : "capacity", stagingCapacity === undefined
+            ? `The ${format} result could not fit in a runtime string. The original result was not written.`
+            : "The temporary storage could not stage the TOON result. The original result was not written.", {
+            format,
+            ...(stagingCapacity === undefined
+                ? {
+                    formatted_characters: null,
+                    max_string_characters: constants.MAX_STRING_LENGTH,
+                }
+                : { system_code: stagingCapacity }),
+            ...(originalFailure === undefined
+                ? {}
+                : { original_failure: originalFailure }),
+        }, {
+            cause: formattingCause,
+            retryable: false,
+            remediationAction: stagingCapacity === undefined
+                ? "Use --format json to stream the complete result, or narrow it with --filter-output. Token limits are applied after formatting and cannot avoid this constraint."
+                : "Free space in the system temporary directory, use --format json, or narrow the result with --filter-output.",
+        }), completed.receipt);
+        error = projectAnalysisError(cause instanceof ToonOutputCleanupFailure
+            ? analysisErrorWithCleanupDependencies(refusal, cause, completed.metadata.command)
+            : refusal);
+        const document = options.fullOutput
+            ? {
+                ok: false,
+                error,
+                meta: {
+                    command: completed.metadata.command,
+                    duration: completed.metadata.duration,
+                },
+            }
+            : error;
+        // Recovery must remain actionable even when a token window/count was
+        // requested. Do not apply those controls to this small typed failure.
+        const recoveryFormat = format === "csv" || format === "tsv" ? "json" : format;
+        const text = formatCliOutput(format === "jsonl" ? jsonLinesErrorRecord(document) : document, recoveryFormat);
+        handled = true;
+        try {
+            await writeOutputText(destination, `${text}\n`);
+        }
+        catch (writeFailure) {
+            failed = true;
+            throw writeFailure;
+        }
+        return true;
+    };
+    const write = async (value, metadata) => {
+        completed = undefined;
+        // Only the full-output envelope shows the result's control flags, so the
+        // result is read for them only then.
+        const cliControls = options.fullOutput
+            ? metadata.collectCliControls?.()
+            : undefined;
+        const selectedMetadata = cliControls === undefined ? metadata : { ...metadata, cliControls };
+        const filterPaths = options.filterPaths?.ok
+            ? options.filterPaths.value
+            : undefined;
+        const operationFailure = metadata.failure
+            ? value
+            : format === "jsonl" || options.fullOutput || filterPaths !== undefined
+                ? cliOperationFailurePayload(value)
+                : undefined;
+        // These presentations own complete documents. A terminal notice must not
+        // become part of their selected view, retained envelope or token count.
+        const ownsDocument = operationFailure !== undefined ||
+            (filterPaths !== undefined && filterPaths.length > 0) ||
+            (options.tokenWindow && !options.tokenCount) ||
+            (options.fullOutput &&
+                (options.tokenCount || selectedMetadata.cliControls !== undefined));
+        const presentedMetadata = ownsDocument && selectedMetadata.cta !== undefined
+            ? { ...selectedMetadata, cta: undefined }
+            : selectedMetadata;
+        try {
+            const written = await writeResult(value, presentedMetadata, operationFailure);
+            if (metadata.cta !== undefined &&
+                (!written || !ownsDocument) &&
+                error === undefined &&
+                !options.fullOutput &&
+                !options.tokenCount) {
+                handled = true;
+                await writeOutputText(destination, `${formatCliCallToAction(metadata.cta)}\n`);
+                return true;
+            }
+            return written;
+        }
+        catch (cause) {
+            if (toonOutputCancellationStatus(cause) !== undefined) {
+                interrupted = true;
+                handled = true;
+                failed = true;
+                throw cause;
+            }
+            if (await recoverFormattingFailure(cause))
+                return true;
+            if (handled)
+                failed = true;
+            throw cause;
+        }
+    };
+    return {
+        get handled() {
+            return handled;
+        },
+        get failed() {
+            return failed;
+        },
+        get error() {
+            return error;
+        },
+        begin(nextOptions) {
+            options = nextOptions;
+            format = options.format;
+            handled = false;
+            failed = false;
+            interrupted = false;
+            error = undefined;
+            completed = undefined;
+        },
+        finish() {
+            return interrupted ? Promise.resolve() : writeOutputText(destination, "");
+        },
+        write,
+        recoverFormattingFailure,
+    };
+    async function writeResult(value, metadata, operationFailure) {
+        completed = {
+            metadata,
+            receipt: cliEvidencePublicationReceipt(),
+            originalFailure: cliOperationFailureIdentity(value),
+        };
+        const filterPaths = options.filterPaths?.ok
+            ? options.filterPaths.value
+            : undefined;
+        const failure = options.fullOutput ? operationFailure : undefined;
+        const ownsFilteredOutput = operationFailure === undefined &&
+            filterPaths !== undefined &&
+            filterPaths.length > 0;
+        if ((format === "toon" || format === "yaml") &&
+            value == null &&
+            !options.fullOutput &&
+            !options.tokenCount &&
+            !options.tokenWindow &&
+            !ownsFilteredOutput)
+            return false;
+        // Suppressed human presentation must never erase
+        // the typed failure that this boundary already owns.
+        if (operationFailure === undefined &&
+            metadata.renderOutput === false &&
+            format !== "jsonl" &&
+            !options.fullOutput &&
+            !options.tokenCount)
+            return false;
+        if (format === "csv" || format === "tsv") {
+            const meta = resultMeta(metadata);
+            if (operationFailure !== undefined) {
+                const parsedFailure = analysisErrorProjectionSchema.safeParse(operationFailure);
+                error = parsedFailure.success
+                    ? parsedFailure.data
+                    : projectAnalysisError(delimitedOutputInputError(["--format"], "CSV/TSV output was not produced because the command did not return a successful row collection.", metadata.command));
+                handled = true;
+                try {
+                    await writeJsonOutput(options.fullOutput
+                        ? { ok: false, error: operationFailure, meta }
+                        : operationFailure, destination);
+                }
+                catch (cause) {
+                    failed = true;
+                    throw cause;
+                }
+                return true;
+            }
+            const selection = resolveDelimitedRows(value, filterPaths, metadata.command);
+            const prepared = selection.ok
+                ? prepareDelimitedOutput(selection.value.rows, format, {
+                    fields: options.columns ?? [],
+                    metadata: delimitedMetadata(selection.value, format, metadata),
+                })
+                : selection;
+            if (!prepared.ok) {
+                error = projectAnalysisError(retainCliPublicationOnError(prepared.error));
+                handled = true;
+                try {
+                    await writeJsonOutput(options.fullOutput ? { ok: false, error, meta } : error, destination);
+                }
+                catch (writeFailure) {
+                    failed = true;
+                    throw writeFailure;
+                }
+            }
+            else {
+                handled = true;
+                try {
+                    await writeOutputParts(destination, formatDelimitedOutputParts(prepared.value));
+                }
+                catch (cause) {
+                    failed = true;
+                    throw cause;
+                }
+            }
+            return true;
+        }
+        const selection = operationFailure !== undefined || filterPaths === undefined
+            ? ok(operationFailure ?? value)
+            : applyCliOutputFilter(value, filterPaths);
+        if (!selection.ok) {
+            error = projectAnalysisError(retainCliPublicationOnError(new AnalysisInputError(metadata.command, {
+                userMessage: selection.error,
+                remediationAction: "Select array indices with slices, or request array properties in a separate --filter-output invocation.",
+            }, [
+                {
+                    path: ["filter-output"],
+                    reason: "invalid_value",
+                    message: selection.error,
+                },
+            ])));
+            const document = options.fullOutput
+                ? {
+                    ok: false,
+                    error,
+                    meta: { command: metadata.command, duration: metadata.duration },
+                }
+                : error;
+            handled = true;
+            await writeOutputText(destination, `${formatCliOutput(format === "jsonl" ? jsonLinesErrorRecord(document) : document, format)}\n`);
+            return true;
+        }
+        const selected = selection.value;
+        const refuseUnrepresentableText = async () => {
+            error = projectAnalysisError(retainCliPublicationOnError(new AnalysisInputError(metadata.command, {
+                userMessage: format === "md"
+                    ? "Markdown cannot preserve NUL or unpaired UTF-16 surrogates in rendered output."
+                    : "TOON cannot preserve unpaired UTF-16 surrogates in UTF-8 output.",
+                remediationAction: "Use --format json or --format yaml to retain the exact code units.",
+                ...(completed?.originalFailure === undefined
+                    ? {}
+                    : {
+                        diagnostics: {
+                            original_failure: completed.originalFailure,
+                        },
+                    }),
+            }, [
+                {
+                    path: ["--format"],
+                    reason: "invalid_value",
+                    message: "The selected format cannot preserve this value.",
+                },
+            ])));
+            const document = options.fullOutput
+                ? {
+                    ok: false,
+                    error,
+                    meta: { command: metadata.command, duration: metadata.duration },
+                }
+                : error;
+            handled = true;
+            try {
+                await writeOutputText(destination, `${formatCliOutput(document, format)}\n`);
+            }
+            catch (cause) {
+                failed = true;
+                throw cause;
+            }
+            return true;
+        };
+        if ((format === "toon" || format === "md") &&
+            !options.tokenCount &&
+            (!options.tokenWindow ||
+                format === "md" ||
+                operationFailure !== undefined) &&
+            (format === "md"
+                ? containsUnrepresentableMarkdown(selected)
+                : containsUnpairedSurrogate(selected)))
+            return refuseUnrepresentableText();
+        const filtered = (format === "json" || format === "jsonl") &&
+            ownsFilteredOutput &&
+            Array.isArray(selected)
+            ? normalizeJsonArrayValues(selected)
+            : selected;
+        const ownsSuccessfulTokenWindow = operationFailure === undefined &&
+            options.tokenWindow &&
+            !options.tokenCount &&
+            format !== "json" &&
+            format !== "jsonl";
+        if (format === "jsonl") {
+            handled = true;
+            try {
+                error = await writeCliJsonLines({
+                    ...options,
+                    source: value,
+                    selected: filtered,
+                    filterPaths,
+                    operationFailure,
+                    command: metadata.command,
+                    duration: metadata.duration,
+                    ...(metadata.cliControls === undefined
+                        ? {}
+                        : { cliControls: metadata.cliControls }),
+                }, destination);
+            }
+            catch (cause) {
+                failed = true;
+                throw cause;
+            }
+            return true;
+        }
+        const meta = resultMeta(metadata);
+        const errorDocument = options.fullOutput && failure !== undefined
+            ? fullFailureEnvelope(failure, meta, format, options.tokenLimit, options.tokenOffset)
+            : undefined;
+        const document = options.fullOutput
+            ? failure !== undefined
+                ? errorDocument
+                : filtered === undefined
+                    ? { ok: true, meta }
+                    : { ok: true, data: filtered, meta }
+            : // A selected null is a value; only a selection with no JSON value
+                // falls back to the empty document.
+                filtered === undefined ||
+                    typeof filtered === "function" ||
+                    typeof filtered === "symbol"
+                    ? {}
+                    : filtered;
+        if (options.tokenCount) {
+            // Token counting materializes JSON. Measure its UTF-16 expansion before
+            // allowing that allocation, independently of UTF-8 bytes. Other formats
+            // require a complete formatted string.
+            const tokenValue = document;
+            let characters = 0;
+            if (tokenValue !== undefined &&
+                tokenValue !== null &&
+                typeof tokenValue !== "function" &&
+                typeof tokenValue !== "symbol") {
+                if (format === "json") {
+                    for (const part of jsonOutputParts(tokenValue, format, isTerminalOutput(destination)))
+                        characters += part.length;
+                }
+            }
+            if (characters <= constants.MAX_STRING_LENGTH) {
+                let formatted;
+                if (format === "json") {
+                    // Reuse the writer's exact representation after its capacity admission.
+                    // tokenx requires one string; retain only this bounded formatted value.
+                    formatted = "";
+                    for (const part of jsonOutputParts(tokenValue, format, isTerminalOutput(destination)))
+                        formatted += part;
+                }
+                else
+                    formatted = formatCliOutput(tokenValue, format);
+                const count = estimateTokenCount(formatted);
+                handled = true;
+                try {
+                    await writeOutputText(destination, `${count}\n`);
+                    return true;
+                }
+                catch (cause) {
+                    failed = true;
+                    throw cause;
+                }
+            }
+            error = projectAnalysisError(retainCliPublicationOnError(new AnalysisResourceConstraintError(metadata.command, "memory", "Token counting requires a formatted string larger than the runtime permits.", {
+                formatted_characters: characters,
+                max_string_characters: constants.MAX_STRING_LENGTH,
+            }, {
+                remediationAction: "Remove --token-count to stream the complete JSON result, or narrow it with --filter-output.",
+            })));
+        }
+        if (ownsSuccessfulTokenWindow) {
+            // Ordinary Markdown windows share rendering/counting's document, including
+            // its missing-selection fallback. Full output windows budget the data
+            // separately from their envelope and retain that policy.
+            const formatted = formatCliOutput(format === "md" && !options.fullOutput ? document : filtered, format);
+            const window = sliceTextByTokenWindow(formatted, options.tokenOffset ?? 0, options.tokenLimit);
+            // Keep the established empty human/agent presentation. Nonempty text
+            // already belongs to this formatter, even when the whole result fits.
+            if (!window.truncated && !options.fullOutput && formatted === "")
+                return false;
+            const sliced = window.truncated
+                ? `${window.text}\n[truncated: showing tokens ${window.start}–${window.end} of ${window.total}]`
+                : formatted;
+            const outputDocument = options.fullOutput
+                ? formatCliOutput(window.truncated
+                    ? {
+                        ok: true,
+                        data: sliced,
+                        meta: {
+                            ...resultMeta(metadata),
+                            ...(window.end < window.total
+                                ? { nextOffset: window.end }
+                                : {}),
+                        },
+                    }
+                    : { ok: true, data: filtered, meta }, format)
+                : sliced;
+            if (format === "toon" && hasUnpairedSurrogate(outputDocument))
+                return refuseUnrepresentableText();
+            handled = true;
+            try {
+                await writeOutputText(destination, outputDocument.endsWith("\n")
+                    ? outputDocument
+                    : `${outputDocument}\n`);
+            }
+            catch (cause) {
+                failed = true;
+                throw cause;
+            }
+            return true;
+        }
+        if (format === "toon") {
+            await writeToonOutput(document, destination, () => {
+                handled = true;
+            }, metadata.command);
+            return true;
+        }
+        // Once writing starts, a failed destination must not receive another document.
+        const formattedText = format === "json" ? undefined : formatCliOutput(document, format);
+        if (format === "md" &&
+            formattedText === "" &&
+            !options.fullOutput &&
+            !ownsFilteredOutput &&
+            operationFailure === undefined)
+            return false;
+        handled = true;
+        try {
+            if (formattedText !== undefined) {
+                // Retain the complete owned projection at the output boundary.
+                await writeOutputText(destination, `${formattedText}\n`);
+            }
+            else {
+                await writeJsonOutput(error === undefined
+                    ? document
+                    : options.fullOutput
+                        ? { ok: false, error, meta }
+                        : error, destination, format);
+            }
+        }
+        catch (cause) {
+            failed = true;
+            throw cause;
+        }
+        return true;
+    }
+};
+const fullFailureEnvelope = (failure, meta, format, tokenLimit, tokenOffset) => {
+    if (tokenLimit === undefined && tokenOffset === undefined)
+        return { ok: false, error: failure, meta };
+    const formatted = formatCliOutput(failure, format);
+    const offset = tokenOffset ?? 0;
+    const window = sliceTextByTokenWindow(formatted, offset, tokenLimit);
+    if (!window.truncated)
+        return { ok: false, error: failure, meta };
+    const nextOffset = window.end < window.total ? window.end : undefined;
+    return {
+        ok: false,
+        error: `${window.text}\n[truncated: showing tokens ${window.start}–${window.end} of ${window.total}]`,
+        meta: { ...meta, ...(nextOffset === undefined ? {} : { nextOffset }) },
+    };
+};
+const resolveDelimitedRows = (source, paths, operation) => {
+    const invalidSelection = () => err(delimitedOutputInputError(["--filter-output"], "--filter-output must select exactly one row-array path using object-field segments only.", operation));
+    if (paths === undefined || paths.length !== 1)
+        return invalidSelection();
+    const path = [];
+    for (const segment of paths[0] ?? []) {
+        if (!("key" in segment))
+            return invalidSelection();
+        path.push(segment.key);
+    }
+    if (path.length === 0)
+        return invalidSelection();
+    let current = source;
+    const ancestors = [];
+    for (const key of path) {
+        if (typeof current !== "object" ||
+            current === null ||
+            Array.isArray(current) ||
+            !Object.hasOwn(current, key))
+            return invalidSelection();
+        const owner = current;
+        ancestors.push(owner);
+        current = owner[key];
+    }
+    return Array.isArray(current)
+        ? ok({ rows: current, path, ancestors })
+        : invalidSelection();
+};
+const delimitedMetadata = (selection, format, metadata) => {
+    const valueFromOwner = (key) => {
+        for (let index = selection.ancestors.length - 1; index >= 0; index -= 1) {
+            const owner = selection.ancestors[index];
+            if (Object.hasOwn(owner, key))
+                return { found: true, value: owner[key] };
+        }
+        return { found: false, value: undefined };
+    };
+    const projectOwnFields = (keys) => Object.fromEntries(keys.flatMap((key) => {
+        const found = valueFromOwner(key);
+        return found.found ? [[key, found.value]] : [];
+    }));
+    const metadataValue = (key) => valueFromOwner(key).value;
+    return {
+        version: 1,
+        format,
+        command: metadata.command,
+        duration: metadata.duration,
+        selected_path: selection.path,
+        coverage: metadataValue("coverage") ?? null,
+        source_coverage: metadataValue("source_coverage") ?? null,
+        source_complete: metadataValue("source_complete") ?? null,
+        view: metadataValue("view") ?? null,
+        limitations: metadataValue("limitations") ?? null,
+        unknowns: metadataValue("unknowns") ?? null,
+        provenance: projectOwnFields([
+            "parent_evidence_id",
+            "parent_operation",
+            "parent_digest",
+            "inventory_evidence_ids",
+        ]),
+        pagination: projectOwnFields([
+            "offset",
+            "limit",
+            "total",
+            "next_offset",
+            "truncated",
+            "pagination",
+        ]),
+    };
+};
+const applyCliOutputFilter = (value, paths) => {
+    if (paths.length === 0)
+        return ok(value);
+    if (Array.isArray(value)) {
+        if (paths.some((path) => path[0] !== undefined && "start" in path[0]))
+            return projectArraySlices(value, paths.flatMap((path) => {
+                const first = path[0];
+                if (first === undefined || "start" in first)
+                    return [path];
+                // Root keys retain implicit per-record traversal, including
+                // numeric keys. Only nested array keys address array positions.
+                return expandImplicitArrayPath(value, path);
+            }));
+        const selected = [];
+        for (const item of value) {
+            const projection = applyCliOutputFilter(item, paths);
+            if (!projection.ok)
+                return projection;
+            selected.push(projection.value);
+        }
+        return ok(selected);
+    }
+    if (paths.length === 1 &&
+        paths[0]?.length === 1 &&
+        paths[0][0] !== undefined &&
+        "key" in paths[0][0]) {
+        const key = paths[0][0].key;
+        if (typeof value !== "object" ||
+            value === null ||
+            !Object.hasOwn(value, key))
+            return ok(undefined);
+        const selected = value[key];
+        return ok(typeof selected !== "object" || selected === null
+            ? selected
+            : { [key]: selected });
+    }
+    return projectObjectPaths(value, paths);
+};
+/** Preserve implicit traversal through every root-array layer before merging slices. */
+const expandImplicitArrayPath = (value, path) => {
+    if (Array.isArray(value))
+        return value.flatMap((item, index) => expandImplicitArrayPath(item, path).map((tail) => [
+            { start: index, end: index + 1 },
+            ...tail,
+        ]));
+    const first = path[0];
+    return typeof value === "object" &&
+        value !== null &&
+        first !== undefined &&
+        "key" in first &&
+        Object.hasOwn(value, first.key)
+        ? [path]
+        : [];
+};
+/** Build a fresh object projection; a path ending at a key selects its subtree. */
+const projectObjectPaths = (value, paths) => {
+    if (typeof value !== "object" || value === null)
+        return ok({});
+    const byKey = new Map();
+    for (const path of paths) {
+        const [segment, ...tail] = path;
+        if (segment === undefined || !("key" in segment))
+            continue;
+        const siblings = byKey.get(segment.key) ?? [];
+        siblings.push(tail);
+        byKey.set(segment.key, siblings);
+    }
+    const result = new Map();
+    for (const key of [...byKey.keys()].sort()) {
+        const siblings = byKey.get(key);
+        if (!Object.hasOwn(value, key))
+            continue;
+        const child = value[key];
+        if (child === undefined)
+            continue;
+        if (siblings.some((path) => path.length === 0)) {
+            result.set(key, child);
+            continue;
+        }
+        const projection = projectChildPaths(child, siblings);
+        if (!projection.ok)
+            return projection;
+        if (projection.value !== undefined)
+            result.set(key, projection.value);
+    }
+    return ok(Object.fromEntries(result));
+};
+/** Keep key-only array projections compatible; mixed projections use source indices. */
+const projectChildPaths = (value, paths) => {
+    if (typeof value !== "object" || value === null)
+        return ok(undefined);
+    return Array.isArray(value) &&
+        paths.some((path) => path[0] !== undefined && "start" in path[0])
+        ? projectArraySlices(value, paths)
+        : projectObjectPaths(value, paths);
+};
+/** Union sliced rows and explicit array indices, then emit them in source order. */
+const projectArraySlices = (source, paths) => {
+    const selected = new Map();
+    const select = (index, tail) => {
+        const siblings = selected.get(index) ?? [];
+        siblings.push(tail);
+        selected.set(index, siblings);
+    };
+    for (const path of paths) {
+        const [segment, ...tail] = path;
+        if (segment === undefined)
+            continue;
+        if ("key" in segment) {
+            // Canonical own array indices share the same identity as slice positions.
+            // Missing properties contribute nothing, as in key-only projections.
+            if (!Object.hasOwn(source, segment.key))
+                continue;
+            const index = Number(segment.key);
+            if (!Number.isInteger(index) ||
+                index < 0 ||
+                index >= 0xffff_ffff ||
+                String(index) !== segment.key)
+                return err(`The --filter-output selection mixes array slices with the non-index property ${JSON.stringify(segment.key)}. These selections cannot share an array result.`);
+            select(index, tail);
+            continue;
+        }
+        const start = normalizeSliceIndex(segment.start, source.length);
+        const end = normalizeSliceIndex(segment.end, source.length);
+        for (let index = start; index < end; index += 1)
+            select(index, tail);
+    }
+    const result = [];
+    for (const index of [...selected.keys()].sort((left, right) => left - right)) {
+        const siblings = selected.get(index);
+        const item = source[index];
+        if (siblings.some((path) => path.length === 0)) {
+            result.push(item === undefined ? null : item);
+            continue;
+        }
+        const projection = projectChildPaths(item, siblings);
+        if (!projection.ok)
+            return projection;
+        // Slices have historically retained selected scalar rows as empty objects.
+        result.push(projection.value ?? {});
+    }
+    return ok(result);
+};
+const normalizeSliceIndex = (index, length) => {
+    const integer = Number.isNaN(index) ? 0 : Math.trunc(index);
+    return integer < 0
+        ? Math.max(length + integer, 0)
+        : Math.min(integer, length);
+};
+/**
+ * The streaming JSON writer requires JSON values in arrays. Copy only array
+ * branches that need normalization so a parent selection never mutates its
+ * source value.
+ */
+const normalizeJsonArrayValues = (source) => {
+    let result;
+    for (let index = 0; index < source.length; index += 1) {
+        const value = source[index];
+        const normalized = value === undefined ||
+            typeof value === "function" ||
+            typeof value === "symbol"
+            ? null
+            : Array.isArray(value)
+                ? normalizeJsonArrayValues(value)
+                : value;
+        if (normalized !== value) {
+            result ??= source.slice();
+            result[index] = normalized;
+        }
+    }
+    return result ?? source;
+};

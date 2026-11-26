@@ -1,0 +1,187 @@
+import { webBundleAcquisitionPartialObservationSchema, webBundleAnalysisSchema, } from "../domain/webBundleAnalysis.js";
+import { webObservationSessionSchema, } from "../domain/browserSession.js";
+import { webMcpDiscoverySchema, } from "../domain/webMcpDiscovery.js";
+import { browserCaptureComparisonSchema, } from "../domain/browserCaptureComparison.js";
+import { webScreenshotSchema, webScreenshotDiffSchema, } from "../domain/webScreenshot.js";
+import { AnalysisCapabilityUnavailableError, AnalysisOutputError, cancelledBy, } from "../domain/analysisErrorCore.js";
+import { err, ok } from "../domain/result.js";
+import { createBrowserEvidence } from "./BrowserEvidence.js";
+import { jsonValueSchema } from "../domain/jsonValue.js";
+import { completeProviderEvidence, keepIncompleteObservation, } from "./ProviderOperationExecution.js";
+import { browserTargetListSchema, webPageInspectionSchema, } from "../domain/browserObservationSchemas.js";
+/** Each completed provider response is admitted by its own operation contract. */
+const browserResultSchemas = {
+    list_browser_targets: browserTargetListSchema,
+    inspect_web_page: webPageInspectionSchema,
+    analyze_web_bundle: webBundleAnalysisSchema,
+    observe_web_session: webObservationSessionSchema,
+    discover_webmcp_tools: webMcpDiscoverySchema,
+    capture_web_screenshot: webScreenshotSchema,
+    compare_web_captures: browserCaptureComparisonSchema,
+    compare_web_screenshots: webScreenshotDiffSchema,
+};
+/** List browser targets within the endpoint and origin scope in the request. */
+export const listBrowserTargets = async (browser, input, options = {}) => {
+    const ready = requireBrowser(browser, "list_browser_targets");
+    if (!ready.ok)
+        return ready;
+    if (options.signal?.aborted)
+        return err(cancelledBy("list_browser_targets", options.signal));
+    const result = await ready.value.listTargets(input, options);
+    return result.ok
+        ? browserEvidence("list_browser_targets", input, result.value, ready.value.identity(), options)
+        : result;
+};
+/** Inspect one page within the endpoint and origin scope in the request. */
+export const inspectWebPage = async (browser, input, options = {}) => {
+    const ready = requireBrowser(browser, "inspect_web_page");
+    if (!ready.ok)
+        return ready;
+    if (options.signal?.aborted)
+        return err(cancelledBy("inspect_web_page", options.signal));
+    const result = await ready.value.inspectPage(input, options);
+    if (!result.ok)
+        return retainBrowserObservation(result.error, input, ready.value, "inspect_web_page");
+    return result.ok
+        ? browserEvidence("inspect_web_page", input, result.value, ready.value.identity(), options)
+        : result;
+};
+/** Capture requested sources and derive static web-bundle evidence. */
+export const analyzeWebBundle = async (browser, input, options = {}) => {
+    const ready = requireBrowser(browser, "analyze_web_bundle");
+    if (!ready.ok)
+        return ready;
+    if (options.signal?.aborted)
+        return err(cancelledBy("analyze_web_bundle", options.signal));
+    const analyzed = await ready.value.analyzeBundle(input, options);
+    if (!analyzed.ok)
+        return retainBrowserObservation(analyzed.error, input, ready.value, "analyze_web_bundle");
+    return browserEvidence("analyze_web_bundle", input, analyzed.value, ready.value.identity(), options);
+};
+/** Observe navigation caused by external user actions during one armed window. */
+export const observeWebSession = async (browser, input, options = {}) => {
+    const ready = requireBrowser(browser, "observe_web_session");
+    if (!ready.ok)
+        return ready;
+    if (options.signal?.aborted)
+        return err(cancelledBy("observe_web_session", options.signal));
+    const observed = await ready.value.observeSession(input, options);
+    return observed.ok
+        ? browserEvidence("observe_web_session", input, observed.value, ready.value.identity(), options)
+        : observed;
+};
+/** Discover WebMCP declarations without exposing an invocation surface. */
+export const discoverWebMcpTools = async (browser, input, options = {}) => {
+    const ready = requireBrowser(browser, "discover_webmcp_tools");
+    if (!ready.ok)
+        return ready;
+    if (options.signal?.aborted)
+        return err(cancelledBy("discover_webmcp_tools", options.signal));
+    const discovered = await ready.value.discoverWebMcpTools(input, options);
+    return discovered.ok
+        ? browserEvidence("discover_webmcp_tools", input, discovered.value, ready.value.identity(), options)
+        : discovered;
+};
+/** Compare two already-normalized web captures without external access. */
+export const compareWebCaptureEvidence = async (browser, input) => {
+    const ready = requireBrowser(browser, "compare_web_captures");
+    if (!ready.ok)
+        return ready;
+    const compared = await ready.value.compareCaptures(input);
+    return compared.ok
+        ? browserEvidence("compare_web_captures", input, compared.value, ready.value.identity(), {})
+        : compared;
+};
+/** Capture one visible-viewport screenshot for the requested target. */
+export const captureWebScreenshot = async (browser, input, options = {}) => {
+    const ready = requireBrowser(browser, "capture_web_screenshot");
+    if (!ready.ok)
+        return ready;
+    if (options.signal?.aborted)
+        return err(cancelledBy("capture_web_screenshot", options.signal));
+    const captured = await ready.value.captureScreenshot(input, options);
+    return captured.ok
+        ? browserEvidence("capture_web_screenshot", input, captured.value, ready.value.identity(), options)
+        : captured;
+};
+/** Compare two self-verifying PNG artifacts without external access. */
+export const compareWebScreenshotEvidence = async (browser, input) => {
+    const ready = requireBrowser(browser, "compare_web_screenshots");
+    if (!ready.ok)
+        return ready;
+    const compared = await ready.value.compareScreenshots(input);
+    return compared.ok
+        ? browserEvidence("compare_web_screenshots", input, compared.value, ready.value.identity(), {})
+        : compared;
+};
+const requireBrowser = (browser, operation) => browser === undefined
+    ? err(new AnalysisCapabilityUnavailableError("rea-cdp-browser", operation, "browser observation provider is not configured"))
+    : ok(browser);
+const browserEvidence = (operation, input, result, provider, options) => {
+    const json = jsonValueSchema.safeParse(result);
+    if (!json.success)
+        return err(new AnalysisOutputError(operation, "Browser provider returned non-JSON observation data.", {
+            cause: json.error,
+        }));
+    // The JSON owner projects only source fields before named schemas inspect them.
+    const report = browserResultSchemas[operation].safeParse(json.data);
+    if (!report.success)
+        return err(new AnalysisOutputError(operation, "Browser provider returned a malformed completed observation.", { cause: report.error }));
+    return completeProviderEvidence(createBrowserEvidence(operation, input, { source: json.data, facts: report.data }, provider), options.signal);
+};
+const NON_JSON_BROWSER_OBSERVATION = "Browser provider retained a non-JSON incomplete observation.";
+/** Promote completed page or bundle facts; keep only a JSON-safe incomplete observation. */
+const retainBrowserObservation = (error, input, provider, errorOperation) => {
+    // Project source JSON before interpreting any provider-owned discriminants.
+    keepIncompleteObservation(error, errorOperation, NON_JSON_BROWSER_OBSERVATION);
+    const seen = new Set();
+    const promoted = new Map();
+    let current = error;
+    while (current !== undefined && !seen.has(current)) {
+        seen.add(current);
+        const partial = current.partialObservation;
+        if (partial !== undefined) {
+            const evidence = promoted.get(partial) ??
+                promoteBrowserObservation(partial, input, provider, errorOperation);
+            if (evidence !== undefined) {
+                promoted.set(partial, evidence);
+                current.partialObservation = evidence;
+            }
+        }
+        current = current.cleanupPrimary;
+    }
+    return err(error);
+};
+/** Each cleanup owner can become the selected error after cleanup succeeds. */
+const promoteBrowserObservation = (partial, input, provider, errorOperation) => {
+    if (errorOperation === "analyze_web_bundle" &&
+        "kind" in partial &&
+        partial.kind === "web-bundle-acquisition") {
+        const acquisition = webBundleAcquisitionPartialObservationSchema.safeParse(partial);
+        if (acquisition.success) {
+            return createBrowserEvidence("analyze_web_bundle", input, { source: jsonValueSchema.parse(partial), facts: acquisition.data }, provider.identity());
+        }
+    }
+    if (errorOperation === "analyze_web_bundle" &&
+        !("evidence_id" in partial) &&
+        "observations" in partial &&
+        "capture" in partial) {
+        const bundle = webBundleAnalysisSchema.safeParse(partial);
+        if (bundle.success) {
+            return createBrowserEvidence("analyze_web_bundle", input, { source: jsonValueSchema.parse(partial), facts: bundle.data }, provider.identity());
+        }
+    }
+    else if (!("evidence_id" in partial) &&
+        "target" in partial &&
+        "network" in partial &&
+        "capture_window" in partial) {
+        const inspection = webPageInspectionSchema.safeParse(partial);
+        if (inspection.success) {
+            const pageInput = "fetch_source_maps" in input
+                ? (({ fetch_source_maps: _fetchSourceMaps, ...page }) => page)(input)
+                : input;
+            return createBrowserEvidence("inspect_web_page", pageInput, { source: jsonValueSchema.parse(partial), facts: inspection.data }, provider.identity());
+        }
+    }
+    return undefined;
+};

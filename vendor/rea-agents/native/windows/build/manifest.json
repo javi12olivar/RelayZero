@@ -1,0 +1,9 @@
+{
+  "platform": "win32",
+  "architecture": "x64",
+  "abiVersion": 1,
+  "nodeApiVersion": 8,
+  "artifact": "rea-windows-x64.node",
+  "packageVersion": "6.10.1",
+  "artifactSha256": "801a9994a5edaef8479d63a8ffed08c52013f5c044a6a04b0a3164cd60bee9a5"
+}

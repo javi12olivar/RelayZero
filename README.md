@@ -1,6 +1,6 @@
 # RelayZero
 
-**RelayZero connects supported AI chat websites to VS Code, with [REA (Reverse Engineer Anything)](https://github.com/morluto/rea) as a core MCP tool server.** A Chrome or Edge extension provides the chat interface, a local Python bridge routes agent requests, and REA supplies the reverse-engineering and artifact-analysis capabilities.
+**RelayZero is free, open-source AI coding through supported browser chat sites, connected to VS Code and powered by [REA (Reverse Engineer Anything)](https://github.com/morluto/rea).** A Chrome or Edge extension provides the chat interface, a local Python bridge routes agent requests, and REA supplies the reverse-engineering and artifact-analysis capabilities.
 
 > **REA is a core part of RelayZero.** Its MCP server is bundled in this repository, configured by default, and started locally alongside the VS Code MCP server. You do not need a separate global REA installation.
 

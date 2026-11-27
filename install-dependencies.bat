@@ -244,6 +244,20 @@ call :node_supported
 
 if not errorlevel 1 goto :node_ready
 
+echo   [RETRY] WinGet did not upgrade the detected Node.js package; forcing the current LTS installer...
+
+winget install --id OpenJS.NodeJS.LTS --exact --source winget --silent --force --accept-package-agreements --accept-source-agreements
+
+if errorlevel 1 goto :node_failed
+
+call :refresh_node_path
+
+call :node_supported
+
+if errorlevel 1 goto :node_failed
+
+goto :node_ready
+
 :install_node
 
 echo   [INSTALL] Node.js LTS...
@@ -252,20 +266,29 @@ call :require_winget || goto :failed
 
 winget install --id OpenJS.NodeJS.LTS --exact --source winget --silent --accept-package-agreements --accept-source-agreements
 
-if errorlevel 1 goto :failed
+if errorlevel 1 goto :node_failed
 
 call :refresh_node_path
 
 call :node_supported
 
-if errorlevel 1 goto :failed
+if errorlevel 1 goto :node_failed
 
-echo   [OK] Node.js is REA-compatible.
+goto :node_ready
+
+:node_failed
+
+echo   [ERROR] Node.js is still below the required version after WinGet.
+
+where node 2>nul
+
+node --version 2>nul
+
+goto :failed
 
 :node_ready
 
-for /f "tokens=*" %%v in ('node --version 2^>^&1') do echo   [OK] Node.js %%v
-
+echo   [OK] Node.js is REA-compatible.
 REM VS Code -------------------------------------------------------------------
 
 call :find_code

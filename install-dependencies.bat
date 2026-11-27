@@ -100,6 +100,12 @@ if exist "%ProgramFiles(x86)%\Microsoft VS Code\bin\code.cmd" set "CODE="%Progra
 
 exit /b 0
 
+:has_vscode_mcp
+for /f "delims=" %%E in ('call %CODE% --list-extensions 2^>nul') do (
+    if /i "%%E"=="nabheet.vscode-ide-mcp" exit /b 0
+)
+exit /b 1
+
 :refresh_code_path
 
 if exist "%LOCALAPPDATA%\Programs\Microsoft VS Code\bin" set "PATH=%LOCALAPPDATA%\Programs\Microsoft VS Code\bin;%PATH%"
@@ -158,8 +164,6 @@ echo.
 echo   ERROR: dependency setup did not complete.
 
 echo   Check the command output above, internet access, and any Windows installer prompts.
-
-echo   Node.js must be 22.23.4+, 24.22.1+, or 26.12.1+.
 
 echo   Re-run install-dependencies.bat after fixing the problem.
 
@@ -277,6 +281,7 @@ goto :node_failed
 :node_failed
 
 echo   [ERROR] Could not install a REA-compatible Node.js version.
+echo   Node.js must be 22.23.4+, 24.22.1+, or 26.12.1+.
 
 echo   WinGet install exit code: %NODE_INSTALL_EXIT%
 
@@ -313,7 +318,7 @@ if not defined CODE goto :failed
 
 echo   [OK] Visual Studio Code found.
 
-call %CODE% --list-extensions 2>nul | findstr /i /x "nabheet.vscode-ide-mcp" >nul
+call :has_vscode_mcp
 
 if errorlevel 1 (
 
@@ -321,13 +326,13 @@ if errorlevel 1 (
 
     call %CODE% --install-extension nabheet.vscode-ide-mcp
 
-    if errorlevel 1 goto :failed
-
 )
 
-call %CODE% --list-extensions 2>nul | findstr /i /x "nabheet.vscode-ide-mcp" >nul
-
-if errorlevel 1 goto :failed
+call :has_vscode_mcp
+if errorlevel 1 (
+    echo   ERROR: VS Code does not list nabheet.vscode-ide-mcp after setup.
+    goto :failed
+)
 
 echo   [OK] VS Code MCP extension
 

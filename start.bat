@@ -45,13 +45,10 @@ goto :dependencies_required
 :python_ready
 for /f "tokens=*" %%v in ('call %PY% --version 2^>^&1') do echo   [OK] %%v with websockets
 
-REM REA is a core server: confirm its runtime setup exists without installing it.
-where node >nul 2>nul || goto :dependencies_required
-where npm >nul 2>nul || goto :dependencies_required
-powershell -NoProfile -NonInteractive -Command "$raw=(node --version).TrimStart(''v''); if ($raw.Contains(''-'')) { exit 1 }; $v=[version]$raw; $ok=(($v.Major -eq 22) -and ($v -ge [version]''22.23.4'')) -or (($v.Major -eq 24) -and ($v -ge [version]''24.22.1'')) -or (($v.Major -eq 26) -and ($v -ge [version]''26.12.1'')) -or ($v.Major -ge 27); if ($ok) { exit 0 }; exit 1" >nul 2>nul
-if errorlevel 1 goto :dependencies_required
-if not exist "%~dp0vendor\rea-agents\node_modules\.relayzero-ready" goto :dependencies_required
-echo   [OK] Node.js and bundled REA dependencies
+REM The bridge can start even when REA still needs setup.
+where node.exe >nul 2>nul
+if errorlevel 1 echo   WARNING: Node.js is unavailable. Run install-dependencies.bat to set up REA.
+if not exist "%~dp0vendor\rea-agents\node_modules\.relayzero-ready" echo   WARNING: REA needs setup. Run install-dependencies.bat.
 
 REM Do not terminate another process if RelayZero's port is already occupied.
 set "OLDPID="
@@ -80,7 +77,7 @@ exit /b %BRIDGE_EXIT%
 
 :dependencies_required
 echo.
-echo   ERROR: Required dependencies are missing or incompatible.
+echo   ERROR: Python 3.9+ with websockets 15 is required to start the bridge.
 echo   Run install-dependencies.bat once, then run start.bat again.
 call :log "FATAL: prerequisites missing; asked user to run install-dependencies.bat."
 pause

@@ -35,15 +35,15 @@ REA is distributed under its MIT license; see `vendor/rea-agents/LICENSE` and `v
 - A supported Node.js release for REA.
 - VS Code with the third-party `nabheet.vscode-ide-mcp` extension.
 
-The included Windows installer detects existing dependencies and installs missing components with `winget`. It also installs REA's lockfile-pinned production dependencies on first run. It does not configure macOS or Linux.
+The included Windows installer detects existing dependencies and installs missing components with `winget`. It also installs REA's lockfile-pinned production dependencies on first run. `start.bat` only checks runtime prerequisites and starts the bridge; it does not install or update software. It does not configure macOS or Linux.
 
 ## Install and run
 
 1. Download or clone this repository.
-2. Run `install-dependencies.bat`, or run `start.bat` (which checks dependencies first).
+2. Run `install-dependencies.bat` once to detect and install missing dependencies.
 3. In Chrome or Edge, open `chrome://extensions` or `edge://extensions`, enable **Developer mode**, choose **Load unpacked**, and select `relayzero-extension/`.
-4. Open a folder in VS Code and open one of the supported AI chat sites.
-5. Start the agent from the RelayZero panel.
+4. Open a folder in VS Code and run `start.bat` to start the local bridge.
+5. Open a supported AI chat site and start the agent from the RelayZero panel.
 
 The first setup needs internet access to install REA's production dependencies from the included `npm-shrinkwrap.json`. Installed dependencies are kept under `vendor/rea-agents/node_modules/` and excluded from Git.
 

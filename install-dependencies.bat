@@ -165,11 +165,9 @@ echo   Re-run install-dependencies.bat after fixing the problem.
 
 echo.
 
-if /i "%~1"=="/from-start" goto :fail_return
 
 pause
 
-:fail_return
 
 exit /b 1
 
@@ -379,12 +377,11 @@ echo   One manual browser step remains: open chrome://extensions or edge://exten
 
 echo   enable Developer mode, and Load unpacked: "%~dp0relayzero-extension"
 
-if /i "%~1"=="/from-start" echo   Returning to start.bat now.
-if /i not "%~1"=="/from-start" echo   Then run start.bat.
+echo   Then run start.bat.
 
 echo.
 
-if /i not "%~1"=="/from-start" pause
+pause
 exit /b 0
 
 

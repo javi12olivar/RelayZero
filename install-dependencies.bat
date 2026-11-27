@@ -66,7 +66,7 @@ exit /b %errorlevel%
 
 where node >nul 2>nul || exit /b 1
 
-node -e "const v=process.versions.node;const [major,minor,patch]=v.split('.').map(Number);process.exit((!v.includes('-')&&(((major===22&&(minor>23||(minor===23&&patch>=4)))||(major===24&&(minor>22||(minor===22&&patch>=1)))||(major===26&&(minor>12||(minor===12&&patch>=1)))||major>=27)))?0:1)" >nul 2>nul
+powershell -NoProfile -NonInteractive -Command "$raw=(node --version).TrimStart('v'); if ($raw.Contains('-')) { exit 1 }; $v=[version]$raw; $ok=(($v.Major -eq 22) -and ($v -ge [version]'22.23.4')) -or (($v.Major -eq 24) -and ($v -ge [version]'24.22.1')) -or (($v.Major -eq 26) -and ($v -ge [version]'26.12.1')) -or ($v.Major -ge 27); if ($ok) { exit 0 }; exit 1" >nul 2>nul
 
 exit /b %errorlevel%
 

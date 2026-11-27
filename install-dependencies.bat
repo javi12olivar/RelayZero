@@ -248,15 +248,15 @@ echo   [RETRY] WinGet did not upgrade the detected Node.js package; forcing the 
 
 winget install --id OpenJS.NodeJS.LTS --exact --source winget --silent --force --accept-package-agreements --accept-source-agreements
 
-if errorlevel 1 goto :node_failed
+set "NODE_INSTALL_EXIT=%errorlevel%"
 
 call :refresh_node_path
 
 call :node_supported
 
-if errorlevel 1 goto :node_failed
+if not errorlevel 1 goto :node_ready
 
-goto :node_ready
+goto :node_failed
 
 :install_node
 
@@ -266,19 +266,21 @@ call :require_winget || goto :failed
 
 winget install --id OpenJS.NodeJS.LTS --exact --source winget --silent --accept-package-agreements --accept-source-agreements
 
-if errorlevel 1 goto :node_failed
+set "NODE_INSTALL_EXIT=%errorlevel%"
 
 call :refresh_node_path
 
 call :node_supported
 
-if errorlevel 1 goto :node_failed
+if not errorlevel 1 goto :node_ready
 
-goto :node_ready
+goto :node_failed
 
 :node_failed
 
-echo   [ERROR] Node.js is still below the required version after WinGet.
+echo   [ERROR] Could not install a REA-compatible Node.js version.
+
+echo   WinGet install exit code: %NODE_INSTALL_EXIT%
 
 where node 2>nul
 
